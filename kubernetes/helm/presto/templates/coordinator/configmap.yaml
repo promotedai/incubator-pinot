@@ -22,6 +22,12 @@ kind: ConfigMap
 metadata:
   name: presto-catalog
 data:
+  mysql.properties: |-
+    connector.name={{ .Values.mysql.connectorName }}
+    connection-url={{ .Values.mysql.connectionUrl }}
+    connection-user={{ .Values.mysql.connectionUser }}
+    connection-password={{ .Values.mysql.connectionPassword }}
+    mysql.connection-timeout={{ .Values.mysql.connectionTimeout }}
   pinot.properties: |-
     connector.name={{ .Values.pinot.connectorName }}
     pinot.controller-urls={{ .Values.pinot.controllerUrls }}
