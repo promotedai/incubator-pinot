@@ -24,6 +24,13 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+mysql:
+  connectorName: mysql
+  connectionUrl: mysql:3306
+  connectionUser: my-db-user
+  connectionPassword: a-random-secret-password
+  connectionTimeout: 600s
+
 pinot:
   connectorName: pinot
   controllerUrls: pinot-controller:9000
