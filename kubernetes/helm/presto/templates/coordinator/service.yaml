@@ -28,10 +28,13 @@ metadata:
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
 spec:
-  type: ClusterIP
+  type: {{ .Values.controller.service.type }}
   ports:
     # [pod_name].[service_name].[namespace].svc.cluster.local
     - port: {{ .Values.coordinator.service.port }}
+      {{- if eq $root.Values.coordinator.service.type "NodePort" }}
+      nodePort: {{ .Values.coordinator.service.nodePort }}
+      {{- end }}
   selector:
     app: {{ include "presto.name" . }}
     release: {{ .Release.Name }}
