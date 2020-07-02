@@ -32,7 +32,7 @@ spec:
   ports:
     # [pod_name].[service_name].[namespace].svc.cluster.local
     - port: {{ .Values.coordinator.service.port }}
-      {{- if eq $root.Values.coordinator.service.type "NodePort" }}
+      {{- if eq .Values.coordinator.service.type "NodePort" }}
       nodePort: {{ .Values.coordinator.service.nodePort }}
       {{- end }}
   selector:
