@@ -28,10 +28,13 @@ metadata:
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
 spec:
-  type: ClusterIP
+  type: {{ .Values.broker.service.type }}
   ports:
     # [pod_name].[service_name].[namespace].svc.cluster.local
     - port: {{ .Values.broker.service.port }}
+      {{- if eq .Values.broker.service.type "NodePort" }}
+      nodePort: {{ .Values.broker.service.nodePort }}
+      {{- end }}
   selector:
     app: {{ include "pinot.name" . }}
     release: {{ .Release.Name }}
