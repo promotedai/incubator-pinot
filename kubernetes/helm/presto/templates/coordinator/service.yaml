@@ -28,7 +28,7 @@ metadata:
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
 spec:
-  type: {{ .Values.controller.service.type }}
+  type: {{ .Values.coordinator.service.type }}
   ports:
     # [pod_name].[service_name].[namespace].svc.cluster.local
     - port: {{ .Values.coordinator.service.port }}
