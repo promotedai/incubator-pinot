@@ -25,7 +25,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.apache.commons.io.FileUtils;
-import org.apache.pinot.common.request.BrokerRequest;
 import org.apache.pinot.common.segment.ReadMode;
 import org.apache.pinot.core.indexsegment.IndexSegment;
 import org.apache.pinot.core.indexsegment.generator.SegmentGeneratorConfig;
@@ -36,9 +35,10 @@ import org.apache.pinot.core.plan.DictionaryBasedAggregationPlanNode;
 import org.apache.pinot.core.plan.MetadataBasedAggregationPlanNode;
 import org.apache.pinot.core.plan.PlanNode;
 import org.apache.pinot.core.plan.SelectionPlanNode;
+import org.apache.pinot.core.query.request.context.QueryContext;
+import org.apache.pinot.core.query.request.context.utils.QueryContextConverterUtils;
 import org.apache.pinot.core.segment.creator.SegmentIndexCreationDriver;
 import org.apache.pinot.core.segment.creator.impl.SegmentIndexCreationDriverImpl;
-import org.apache.pinot.pql.parsers.Pql2Compiler;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.data.FieldSpec;
@@ -46,13 +46,16 @@ import org.apache.pinot.spi.data.FieldSpec.DataType;
 import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.data.TimeGranularitySpec;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
-import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.AfterTest;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.BeforeTest;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
+
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertTrue;
 
 
 public class MetadataAndDictionaryAggregationPlanMakerTest {
@@ -61,7 +64,6 @@ public class MetadataAndDictionaryAggregationPlanMakerTest {
   private static final File INDEX_DIR =
       new File(FileUtils.getTempDirectory(), "MetadataAndDictionaryAggregationPlanMakerTest");
 
-  private static final Pql2Compiler COMPILER = new Pql2Compiler();
   private static final InstancePlanMakerImplV2 PLAN_MAKER = new InstancePlanMakerImplV2();
   private IndexSegment _indexSegment = null;
 
@@ -72,7 +74,7 @@ public class MetadataAndDictionaryAggregationPlanMakerTest {
 
     // Get resource file path.
     URL resource = getClass().getClassLoader().getResource(AVRO_DATA);
-    Assert.assertNotNull(resource);
+    assertNotNull(resource);
     String filePath = resource.getFile();
 
     // Build the segment schema.
@@ -127,9 +129,9 @@ public class MetadataAndDictionaryAggregationPlanMakerTest {
 
   @Test(dataProvider = "testPlanNodeMakerDataProvider")
   public void testInstancePlanMakerForMetadataAndDictionaryPlan(String query, Class<? extends PlanNode> planNodeClass) {
-    BrokerRequest brokerRequest = COMPILER.compileToBrokerRequest(query);
-    PlanNode plan = PLAN_MAKER.makeInnerSegmentPlan(_indexSegment, brokerRequest);
-    Assert.assertTrue(planNodeClass.isInstance(plan));
+    QueryContext queryContext = QueryContextConverterUtils.getQueryContextFromPQL(query);
+    PlanNode plan = PLAN_MAKER.makeSegmentPlanNode(_indexSegment, queryContext);
+    assertTrue(planNodeClass.isInstance(plan));
   }
 
   @DataProvider(name = "testPlanNodeMakerDataProvider")
@@ -170,19 +172,15 @@ public class MetadataAndDictionaryAggregationPlanMakerTest {
   @Test(dataProvider = "isFitForPlanDataProvider")
   public void testIsFitFor(String query, IndexSegment indexSegment, boolean expectedIsFitForMetadata,
       boolean expectedIsFitForDictionary) {
-    BrokerRequest brokerRequest = COMPILER.compileToBrokerRequest(query);
-
-    boolean isFitForMetadataBasedPlan = InstancePlanMakerImplV2.isFitForMetadataBasedPlan(brokerRequest, indexSegment);
-    boolean isFitForDictionaryBasedPlan =
-        InstancePlanMakerImplV2.isFitForDictionaryBasedPlan(brokerRequest, indexSegment);
-    Assert.assertEquals(isFitForMetadataBasedPlan, expectedIsFitForMetadata);
-    Assert.assertEquals(isFitForDictionaryBasedPlan, expectedIsFitForDictionary);
+    QueryContext queryContext = QueryContextConverterUtils.getQueryContextFromPQL(query);
+    assertEquals(InstancePlanMakerImplV2.isFitForMetadataBasedPlan(queryContext), expectedIsFitForMetadata);
+    assertEquals(InstancePlanMakerImplV2.isFitForDictionaryBasedPlan(queryContext, indexSegment),
+        expectedIsFitForDictionary);
   }
 
   @DataProvider(name = "isFitForPlanDataProvider")
   public Object[][] provideDataForIsFitChecks() {
     List<Object[]> entries = new ArrayList<>();
-    entries.add(new Object[]{"select * from testTable", _indexSegment, false, false});
     entries.add(
         new Object[]{"select count(*) from testTable", _indexSegment, true, false /* count* from metadata, even if star tree present */});
     entries.add(
@@ -192,11 +190,6 @@ public class MetadataAndDictionaryAggregationPlanMakerTest {
     entries.add(
         new Object[]{"select count(*),max(daysSinceEpoch) from testTable", _indexSegment, false, false /* count* and max(time) from metadata*/});
     entries.add(new Object[]{"select sum(column1) from testTable", _indexSegment, false, false});
-    entries.add(new Object[]{"select count(*) from testTable group by daysSinceEpoch", _indexSegment, false, false});
-    entries.add(new Object[]{"select count(*) from testTable where daysSinceEpoch > 1", _indexSegment, false, false});
-    entries.add(
-        new Object[]{"select max(column5) from testTable where daysSinceEpoch > 100", _indexSegment, false, false});
-    entries.add(new Object[]{"select column1 from testTable", _indexSegment, false, false});
     return entries.toArray(new Object[entries.size()][]);
   }
 }

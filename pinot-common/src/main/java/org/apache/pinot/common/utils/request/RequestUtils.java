@@ -20,12 +20,8 @@ package org.apache.pinot.common.utils.request;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.Stack;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNumericLiteral;
 import org.apache.commons.lang.mutable.MutableInt;
@@ -35,13 +31,8 @@ import org.apache.pinot.common.request.ExpressionType;
 import org.apache.pinot.common.request.FilterQuery;
 import org.apache.pinot.common.request.FilterQueryMap;
 import org.apache.pinot.common.request.Function;
-import org.apache.pinot.common.request.HavingFilterQuery;
-import org.apache.pinot.common.request.HavingFilterQueryMap;
 import org.apache.pinot.common.request.Identifier;
 import org.apache.pinot.common.request.Literal;
-import org.apache.pinot.common.request.Selection;
-import org.apache.pinot.common.request.SelectionSort;
-import org.apache.pinot.common.request.transform.TransformExpressionTree;
 import org.apache.pinot.pql.parsers.pql2.ast.AstNode;
 import org.apache.pinot.pql.parsers.pql2.ast.FloatingPointLiteralAstNode;
 import org.apache.pinot.pql.parsers.pql2.ast.FunctionCallAstNode;
@@ -190,17 +181,6 @@ public class RequestUtils {
     return expression;
   }
 
-  public static void generateFilterFromTree(HavingQueryTree filterQueryTree, BrokerRequest request) {
-    Map<Integer, HavingFilterQuery> filterQueryMap = new HashMap<>();
-    MutableInt currentId = new MutableInt(0);
-    HavingFilterQuery root = traverseHavingFilterQueryAndPopulateMap(filterQueryTree, filterQueryMap, currentId);
-    filterQueryMap.put(root.getId(), root);
-    request.setHavingFilterQuery(root);
-    HavingFilterQueryMap mp = new HavingFilterQueryMap();
-    mp.setFilterQueryMap(filterQueryMap);
-    request.setHavingFilterSubQueryMap(mp);
-  }
-
   private static FilterQuery traverseFilterQueryAndPopulateMap(FilterQueryTree tree,
       Map<Integer, FilterQuery> filterQueryMap, MutableInt currentId) {
     int currentNodeId = currentId.intValue();
@@ -223,31 +203,6 @@ public class RequestUtils {
     query.setOperator(tree.getOperator());
     query.setValue(tree.getValue());
     return query;
-  }
-
-  private static HavingFilterQuery traverseHavingFilterQueryAndPopulateMap(HavingQueryTree tree,
-      Map<Integer, HavingFilterQuery> filterQueryMap, MutableInt currentId) {
-    int currentNodeId = currentId.intValue();
-    currentId.increment();
-
-    final List<Integer> filterIds = new ArrayList<>();
-    if (null != tree.getChildren()) {
-      for (final HavingQueryTree child : tree.getChildren()) {
-        int childNodeId = currentId.intValue();
-        currentId.increment();
-        filterIds.add(childNodeId);
-        final HavingFilterQuery filterQuery = traverseHavingFilterQueryAndPopulateMap(child, filterQueryMap, currentId);
-        filterQueryMap.put(childNodeId, filterQuery);
-      }
-    }
-
-    HavingFilterQuery havingFilterQuery = new HavingFilterQuery();
-    havingFilterQuery.setAggregationInfo(tree.getAggregationInfo());
-    havingFilterQuery.setId(currentNodeId);
-    havingFilterQuery.setNestedFilterQueryIds(filterIds);
-    havingFilterQuery.setOperator(tree.getOperator());
-    havingFilterQuery.setValue(tree.getValue());
-    return havingFilterQuery;
   }
 
   /**
@@ -282,59 +237,6 @@ public class RequestUtils {
     }
 
     return new FilterQueryTree(q.getColumn(), q.getValue(), q.getOperator(), c);
-  }
-
-  /**
-   * Extracts all columns from the given filter query tree.
-   */
-  public static Set<String> extractFilterColumns(FilterQueryTree root) {
-    Set<String> filterColumns = new HashSet<>();
-    if (root.getChildren() == null) {
-      root.getExpression().getColumns(filterColumns);
-    } else {
-      Stack<FilterQueryTree> stack = new Stack<>();
-      stack.add(root);
-      while (!stack.empty()) {
-        FilterQueryTree node = stack.pop();
-        for (FilterQueryTree child : node.getChildren()) {
-          if (child.getChildren() == null) {
-            child.getExpression().getColumns(filterColumns);
-          } else {
-            stack.push(child);
-          }
-        }
-      }
-    }
-    return filterColumns;
-  }
-
-  /**
-   * Extracts all columns from the given expressions.
-   */
-  public static Set<String> extractColumnsFromExpressions(Set<TransformExpressionTree> expressions) {
-    Set<String> expressionColumns = new HashSet<>();
-    for (TransformExpressionTree expression : expressions) {
-      expression.getColumns(expressionColumns);
-    }
-    return expressionColumns;
-  }
-
-  /**
-   * Extracts all columns from the given selection, '*' will be ignored.
-   */
-  public static Set<String> extractSelectionColumns(Selection selection) {
-    Set<String> selectionColumns = new LinkedHashSet<>();
-    for (String selectionColumn : selection.getSelectionColumns()) {
-      if (!selectionColumn.equals("*")) {
-        selectionColumns.add(selectionColumn);
-      }
-    }
-    if (selection.getSelectionSortSequence() != null) {
-      for (SelectionSort selectionSort : selection.getSelectionSortSequence()) {
-        selectionColumns.add(selectionSort.getColumn());
-      }
-    }
-    return selectionColumns;
   }
 
   /**

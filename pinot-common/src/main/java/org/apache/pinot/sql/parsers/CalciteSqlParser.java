@@ -279,7 +279,9 @@ public class CalciteSqlParser {
           pinotQuery.setOffset(Integer.valueOf(((SqlNumericLiteral) selectSqlNode.getOffset()).toValue()));
         }
         DataSource dataSource = new DataSource();
-        dataSource.setTableName(selectSqlNode.getFrom().toString());
+        if (selectSqlNode.getFrom() != null) {
+          dataSource.setTableName(selectSqlNode.getFrom().toString());
+        }
         pinotQuery.setDataSource(dataSource);
         if (selectSqlNode.getModifierNode(SqlSelectKeyword.DISTINCT) != null) {
           if (selectSqlNode.getGroup() != null) {
@@ -660,7 +662,9 @@ public class CalciteSqlParser {
   private static String extractFunctionName(SqlBasicCall funcSqlNode) {
     String funcName = funcSqlNode.getOperator().getKind().name();
     if (funcSqlNode.getOperator().getKind() == SqlKind.OTHER_FUNCTION) {
-      funcName = funcSqlNode.getOperator().getName();
+      // in-built functions like REGEXP_LIKE, TEXT_MATCH, timeConvert etc that are not natively
+      // supported by Calcite grammar
+      funcName = funcSqlNode.getOperator().getName().toUpperCase();
     }
     if (funcName.equalsIgnoreCase(SqlKind.COUNT.toString()) && (funcSqlNode.getFunctionQuantifier() != null)
         && funcSqlNode.getFunctionQuantifier().toValue().equalsIgnoreCase(AggregationFunctionType.DISTINCT.getName())) {
@@ -711,9 +715,6 @@ public class CalciteSqlParser {
         try {
           FunctionInvoker invoker = new FunctionInvoker(functionInfo);
           Object result = invoker.process(arguments);
-          if (result instanceof String) {
-            result = String.format("'%s'", result);
-          }
           return RequestUtils.getLiteralExpression(result);
         } catch (Exception e) {
           throw new SqlCompilationException(new IllegalArgumentException("Unsupported function - " + funcName, e));
@@ -721,5 +722,19 @@ public class CalciteSqlParser {
       }
     }
     return funcExpr;
+  }
+
+  public static boolean isLiteralOnlyExpression(Expression e) {
+    if (e.getType() == ExpressionType.LITERAL) {
+      return true;
+    }
+    if (e.getType() == ExpressionType.FUNCTION) {
+      Function functionCall = e.getFunctionCall();
+      if (functionCall.getOperator().equalsIgnoreCase(SqlKind.AS.toString())) {
+        return isLiteralOnlyExpression(functionCall.getOperands().get(0));
+      }
+      return false;
+    }
+    return false;
   }
 }

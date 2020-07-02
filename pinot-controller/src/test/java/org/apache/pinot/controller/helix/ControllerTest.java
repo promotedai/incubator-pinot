@@ -184,7 +184,9 @@ public abstract class ControllerTest {
         break;
     }
     //enable case insensitive pql for test cases.
-    configAccessor.set(scope, CommonConstants.Helix.ENABLE_CASE_INSENSITIVE_PQL_KEY, Boolean.TRUE.toString());
+    configAccessor.set(scope, CommonConstants.Helix.ENABLE_CASE_INSENSITIVE_KEY, Boolean.toString(true));
+    //Set hyperloglog log2m value to 12.
+    configAccessor.set(scope, CommonConstants.Helix.DEFAULT_HYPERLOGLOG_LOG2M_KEY, Integer.toString(12));
   }
 
   protected ControllerStarter getControllerStarter(ControllerConf config) {

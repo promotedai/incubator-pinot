@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.commons.configuration.Configuration;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.helix.ZNRecord;
@@ -55,23 +56,34 @@ import org.apache.pinot.common.metrics.BrokerMetrics;
 import org.apache.pinot.common.metrics.BrokerQueryPhase;
 import org.apache.pinot.common.request.AggregationInfo;
 import org.apache.pinot.common.request.BrokerRequest;
+import org.apache.pinot.common.request.Expression;
+import org.apache.pinot.common.request.ExpressionType;
 import org.apache.pinot.common.request.FilterOperator;
 import org.apache.pinot.common.request.FilterQuery;
 import org.apache.pinot.common.request.FilterQueryMap;
+import org.apache.pinot.common.request.Function;
+import org.apache.pinot.common.request.Identifier;
+import org.apache.pinot.common.request.Literal;
+import org.apache.pinot.common.request.PinotQuery;
 import org.apache.pinot.common.request.Selection;
 import org.apache.pinot.common.request.SelectionSort;
 import org.apache.pinot.common.request.transform.TransformExpressionTree;
 import org.apache.pinot.common.response.BrokerResponse;
 import org.apache.pinot.common.response.broker.BrokerResponseNative;
+import org.apache.pinot.common.response.broker.ResultTable;
 import org.apache.pinot.common.utils.CommonConstants;
 import org.apache.pinot.common.utils.CommonConstants.Broker;
+import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.common.utils.helix.TableCache;
+import org.apache.pinot.common.utils.request.RequestUtils;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunctionUtils;
 import org.apache.pinot.core.query.reduce.BrokerReduceService;
 import org.apache.pinot.core.transport.ServerInstance;
 import org.apache.pinot.core.util.QueryOptions;
 import org.apache.pinot.spi.config.table.TableType;
+import org.apache.pinot.spi.utils.BytesUtils;
 import org.apache.pinot.spi.utils.builder.TableNameBuilder;
+import org.apache.pinot.sql.parsers.CalciteSqlParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -100,8 +112,9 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
   private final RateLimiter _numDroppedLogRateLimiter;
   private final AtomicInteger _numDroppedLog;
 
-  private final boolean _enableCaseInsensitivePql;
+  private final boolean _enableCaseInsensitive;
   private final boolean _enableQueryLimitOverride;
+  private final int _defaultHllLog2m;
   private final TableCache _tableCache;
 
   public BaseBrokerRequestHandler(Configuration config, RoutingManager routingManager,
@@ -113,12 +126,14 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
     _queryQuotaManager = queryQuotaManager;
     _brokerMetrics = brokerMetrics;
 
-    _enableCaseInsensitivePql = _config.getBoolean(CommonConstants.Helix.ENABLE_CASE_INSENSITIVE_PQL_KEY, false);
-    if (_enableCaseInsensitivePql) {
+    _enableCaseInsensitive = _config.getBoolean(CommonConstants.Helix.ENABLE_CASE_INSENSITIVE_KEY, false);
+    if (_enableCaseInsensitive) {
       _tableCache = new TableCache(propertyStore);
     } else {
       _tableCache = null;
     }
+    _defaultHllLog2m = _config
+        .getInt(CommonConstants.Helix.DEFAULT_HYPERLOGLOG_LOG2M_KEY, CommonConstants.Helix.DEFAULT_HYPERLOGLOG_LOG2M);
 
     _enableQueryLimitOverride = _config.getBoolean(Broker.CONFIG_OF_ENABLE_QUERY_LIMIT_OVERRIDE, false);
 
@@ -166,23 +181,35 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
     BrokerRequest brokerRequest;
     try {
       brokerRequest = PinotQueryParserFactory.get(pinotQueryRequest.getQueryFormat()).compileToBrokerRequest(query);
-      if (_enableCaseInsensitivePql) {
-        //fix table names and column names in the query to match(case sensitive) the table name and column names as define in TableConfig and Schema
-        try {
-          handleCaseSensitivity(brokerRequest);
-        } catch (Exception e) {
-          LOGGER
-              .warn("Caught exception while rewriting PQL to make it case-insensitive {}: {}, {}", requestId, query, e);
-        }
-      }
-      if (_enableQueryLimitOverride) {
-        handleQueryLimitOverride(brokerRequest, _queryResponseLimit);
-      }
     } catch (Exception e) {
       LOGGER.info("Caught exception while compiling request {}: {}, {}", requestId, query, e.getMessage());
       _brokerMetrics.addMeteredGlobalValue(BrokerMeter.REQUEST_COMPILATION_EXCEPTIONS, 1);
       requestStatistics.setErrorCode(QueryException.PQL_PARSING_ERROR_CODE);
       return new BrokerResponseNative(QueryException.getException(QueryException.PQL_PARSING_ERROR, e));
+    }
+    if (isLiteralOnlyQuery(brokerRequest)) {
+      LOGGER.debug("Request {} contains only Literal, skipping server query: {}", requestId, query);
+      try {
+        return processLiteralOnlyBrokerRequest(brokerRequest, compilationStartTimeNs, requestStatistics);
+      } catch (Exception e) {
+        // TODO: refine the exceptions here to early termination the queries won't requires to send to servers.
+        LOGGER
+            .warn("Unable to execute literal request {}: {} at broker, fallback to server query. {}", requestId, query,
+                e.getMessage());
+      }
+    }
+    if (_enableCaseInsensitive) {
+      try {
+        handleCaseSensitivity(brokerRequest);
+      } catch (Exception e) {
+        LOGGER.warn("Caught exception while rewriting PQL to make it case-insensitive {}: {}, {}", requestId, query, e);
+      }
+    }
+    if (_defaultHllLog2m > 0) {
+      handleHyperloglogLog2mOverride(brokerRequest, _defaultHllLog2m);
+    }
+    if (_enableQueryLimitOverride) {
+      handleQueryLimitOverride(brokerRequest, _queryResponseLimit);
     }
     String tableName = brokerRequest.getQuerySource().getTableName();
     String rawTableName = TableNameBuilder.extractRawTableName(tableName);
@@ -373,11 +400,13 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
 
     LOGGER.debug("Broker Response: {}", brokerResponse);
 
+    // Please keep the format as name=value comma-separated with no spaces
+    // Please add new entries at the end
     if (_queryLogRateLimiter.tryAcquire() || forceLog(brokerResponse, totalTimeMs)) {
       // Table name might have been changed (with suffix _OFFLINE/_REALTIME appended)
-      LOGGER.info("RequestId:{}, table:{}, timeMs:{}, docs:{}/{}, entries:{}/{},"
-              + " segments(queried/processed/matched/consuming/unavailable):{}/{}/{}/{}/{}, consumingFreshnessTimeMs:{},"
-              + " servers:{}/{}, groupLimitReached:{}, exceptions:{}, serverStats:{}, query:{}", requestId,
+      LOGGER.info("requestId={},table={},timeMs={},docs={}/{},entries={}/{},"
+              + "segments(queried/processed/matched/consuming/unavailable):{}/{}/{}/{}/{},consumingFreshnessTimeMs={},"
+              + "servers={}/{},groupLimitReached={},exceptions={},serverStats={},query={}", requestId,
           brokerRequest.getQuerySource().getTableName(), totalTimeMs, brokerResponse.getNumDocsScanned(),
           brokerResponse.getTotalDocs(), brokerResponse.getNumEntriesScannedInFilter(),
           brokerResponse.getNumEntriesScannedPostFilter(), brokerResponse.getNumSegmentsQueried(),
@@ -407,6 +436,54 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
   }
 
   /**
+   * Set Log2m value for DistinctCountHLL Function
+   * @param brokerRequest
+   * @param hllLog2mOverride
+   */
+  static void handleHyperloglogLog2mOverride(BrokerRequest brokerRequest, int hllLog2mOverride) {
+    if (brokerRequest.getAggregationsInfo() != null) {
+      for (AggregationInfo aggregationInfo : brokerRequest.getAggregationsInfo()) {
+        switch (aggregationInfo.getAggregationType().toUpperCase()) {
+          case "DISTINCTCOUNTHLL":
+          case "DISTINCTCOUNTHLLMV":
+          case "DISTINCTCOUNTRAWHLL":
+          case "DISTINCTCOUNTRAWHLLMV":
+            if (aggregationInfo.getExpressionsSize() == 1) {
+              aggregationInfo.addToExpressions(Integer.toString(hllLog2mOverride));
+            }
+        }
+      }
+    }
+    if (brokerRequest.getPinotQuery() != null && brokerRequest.getPinotQuery().getSelectList() != null) {
+      for (Expression expr : brokerRequest.getPinotQuery().getSelectList()) {
+        updateDistinctCountHllExpr(expr, hllLog2mOverride);
+      }
+    }
+  }
+
+  private static void updateDistinctCountHllExpr(Expression expr, int hllLog2mOverride) {
+    Function functionCall = expr.getFunctionCall();
+    if (functionCall == null) {
+      return;
+    }
+    switch (functionCall.getOperator().toUpperCase()) {
+      case "DISTINCTCOUNTHLL":
+      case "DISTINCTCOUNTHLLMV":
+      case "DISTINCTCOUNTRAWHLL":
+      case "DISTINCTCOUNTRAWHLLMV":
+        if (functionCall.getOperandsSize() == 1) {
+          functionCall.addToOperands(RequestUtils.getLiteralExpression(hllLog2mOverride));
+        }
+        return;
+    }
+    if (functionCall.getOperandsSize() > 0) {
+      for (Expression operand : functionCall.getOperands()) {
+        updateDistinctCountHllExpr(operand, hllLog2mOverride);
+      }
+    }
+  }
+
+  /**
    * Reset limit for selection query if it exceeds maxQuerySelectionLimit.
    * @param brokerRequest
    * @param queryLimit
@@ -432,6 +509,115 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
           brokerRequest.getPinotQuery().setLimit(queryLimit);
         }
       }
+    }
+  }
+
+  /**
+   * Check if a SQL parsed BrokerRequest is a literal only query.
+   * @param brokerRequest
+   * @return true if this query selects only Literals
+   *
+   */
+  @VisibleForTesting
+  static boolean isLiteralOnlyQuery(BrokerRequest brokerRequest) {
+    if (brokerRequest.getPinotQuery() != null) {
+      for (Expression e : brokerRequest.getPinotQuery().getSelectList()) {
+        if (!CalciteSqlParser.isLiteralOnlyExpression(e)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Compute BrokerResponse for literal only query.
+   *
+   * @param brokerRequest
+   * @param compilationStartTimeNs
+   * @param requestStatistics
+   * @return BrokerResponse
+   */
+  private BrokerResponse processLiteralOnlyBrokerRequest(BrokerRequest brokerRequest, long compilationStartTimeNs,
+      RequestStatistics requestStatistics)
+      throws IllegalStateException {
+    BrokerResponseNative brokerResponse = new BrokerResponseNative();
+    List<String> columnNames = new ArrayList<>();
+    List<DataSchema.ColumnDataType> columnTypes = new ArrayList<>();
+    List<Object> row = new ArrayList<>();
+    for (Expression e : brokerRequest.getPinotQuery().getSelectList()) {
+      computeResultsForExpression(e, columnNames, columnTypes, row);
+    }
+    DataSchema dataSchema =
+        new DataSchema(columnNames.toArray(new String[0]), columnTypes.toArray(new DataSchema.ColumnDataType[0]));
+    List<Object[]> rows = new ArrayList<>();
+    rows.add(row.toArray());
+    ResultTable resultTable = new ResultTable(dataSchema, rows);
+    brokerResponse.setResultTable(resultTable);
+
+    long totalTimeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - compilationStartTimeNs);
+    brokerResponse.setTimeUsedMs(totalTimeMs);
+    requestStatistics.setQueryProcessingTime(totalTimeMs);
+    requestStatistics.setStatistics(brokerResponse);
+    return brokerResponse;
+  }
+
+  // TODO(xiangfu): Move Literal function computation here from Calcite Parser.
+  private void computeResultsForExpression(Expression e, List<String> columnNames,
+      List<DataSchema.ColumnDataType> columnTypes, List<Object> row) {
+    if (e.getType() == ExpressionType.LITERAL) {
+      computeResultsForLiteral(e.getLiteral(), columnNames, columnTypes, row);
+    }
+    if (e.getType() == ExpressionType.FUNCTION) {
+      if (e.getFunctionCall().getOperator().equalsIgnoreCase(SqlKind.AS.toString())) {
+        String columnName = e.getFunctionCall().getOperands().get(1).getIdentifier().getName();
+        computeResultsForExpression(e.getFunctionCall().getOperands().get(0), columnNames, columnTypes, row);
+        columnNames.set(columnNames.size() - 1, columnName);
+      } else {
+        throw new IllegalStateException(
+            "No able to compute results for function - " + e.getFunctionCall().getOperator());
+      }
+    }
+  }
+
+  private void computeResultsForLiteral(Literal literal, List<String> columnNames,
+      List<DataSchema.ColumnDataType> columnTypes, List<Object> row) {
+    Object fieldValue = literal.getFieldValue();
+    columnNames.add(fieldValue.toString());
+    switch (literal.getSetField()) {
+      case BOOL_VALUE:
+        columnTypes.add(DataSchema.ColumnDataType.STRING);
+        row.add(Boolean.toString(literal.getBoolValue()));
+        break;
+      case BYTE_VALUE:
+        columnTypes.add(DataSchema.ColumnDataType.INT);
+        row.add((int) literal.getByteValue());
+        break;
+      case SHORT_VALUE:
+        columnTypes.add(DataSchema.ColumnDataType.INT);
+        row.add((int) literal.getShortValue());
+        break;
+      case INT_VALUE:
+        columnTypes.add(DataSchema.ColumnDataType.INT);
+        row.add(literal.getIntValue());
+        break;
+      case LONG_VALUE:
+        columnTypes.add(DataSchema.ColumnDataType.LONG);
+        row.add(literal.getLongValue());
+        break;
+      case DOUBLE_VALUE:
+        columnTypes.add(DataSchema.ColumnDataType.DOUBLE);
+        row.add(literal.getDoubleValue());
+        break;
+      case STRING_VALUE:
+        columnTypes.add(DataSchema.ColumnDataType.STRING);
+        row.add(literal.getStringValue());
+        break;
+      case BINARY_VALUE:
+        columnTypes.add(DataSchema.ColumnDataType.BYTES);
+        row.add(BytesUtils.toHexString(literal.getBinaryValue()));
+        break;
     }
   }
 
@@ -484,6 +670,34 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
         selectionSort.setColumn(fixColumnNameCase(actualTableName, expression));
       }
     }
+
+    PinotQuery pinotQuery = brokerRequest.getPinotQuery();
+    if (pinotQuery != null) {
+      pinotQuery.getDataSource().setTableName(actualTableName);
+      for (Expression expression : pinotQuery.getSelectList()) {
+        fixColumnNameCase(actualTableName, expression);
+      }
+      Expression filterExpression = pinotQuery.getFilterExpression();
+      if (filterExpression != null) {
+        fixColumnNameCase(actualTableName, filterExpression);
+      }
+      List<Expression> groupByList = pinotQuery.getGroupByList();
+      if (groupByList != null) {
+        for (Expression expression : groupByList) {
+          fixColumnNameCase(actualTableName, expression);
+        }
+      }
+      List<Expression> orderByList = pinotQuery.getOrderByList();
+      if (orderByList != null) {
+        for (Expression expression : orderByList) {
+          fixColumnNameCase(actualTableName, expression);
+        }
+      }
+      Expression havingExpression = pinotQuery.getHavingExpression();
+      if (havingExpression != null) {
+        fixColumnNameCase(actualTableName, havingExpression);
+      }
+    }
   }
 
   private String fixColumnNameCase(String tableNameWithType, String expression) {
@@ -499,6 +713,18 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
     } else if (expressionType == TransformExpressionTree.ExpressionType.FUNCTION) {
       for (TransformExpressionTree child : expression.getChildren()) {
         fixColumnNameCase(tableNameWithType, child);
+      }
+    }
+  }
+
+  private void fixColumnNameCase(String tableNameWithType, Expression expression) {
+    ExpressionType expressionType = expression.getType();
+    if (expressionType == ExpressionType.IDENTIFIER) {
+      Identifier identifier = expression.getIdentifier();
+      identifier.setName(_tableCache.getActualColumnName(tableNameWithType, identifier.getName()));
+    } else if (expressionType == ExpressionType.FUNCTION) {
+      for (Expression operand : expression.getFunctionCall().getOperands()) {
+        fixColumnNameCase(tableNameWithType, operand);
       }
     }
   }

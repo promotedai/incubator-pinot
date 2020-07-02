@@ -21,47 +21,43 @@ package org.apache.pinot.core.startree.plan;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.annotation.Nullable;
-import org.apache.pinot.common.request.transform.TransformExpressionTree;
-import org.apache.pinot.common.utils.request.FilterQueryTree;
 import org.apache.pinot.core.operator.transform.TransformOperator;
 import org.apache.pinot.core.plan.PlanNode;
+import org.apache.pinot.core.query.request.context.ExpressionContext;
+import org.apache.pinot.core.query.request.context.FilterContext;
 import org.apache.pinot.core.startree.v2.AggregationFunctionColumnPair;
 import org.apache.pinot.core.startree.v2.StarTreeV2;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 
 public class StarTreeTransformPlanNode implements PlanNode {
-  private static final Logger LOGGER = LoggerFactory.getLogger(StarTreeTransformPlanNode.class);
-
-  private final Set<TransformExpressionTree> _groupByExpressions;
+  private final List<ExpressionContext> _groupByExpressions;
   private final StarTreeProjectionPlanNode _starTreeProjectionPlanNode;
 
   public StarTreeTransformPlanNode(StarTreeV2 starTreeV2,
-      AggregationFunctionColumnPair[] aggregationFunctionColumnPairs,
-      @Nullable TransformExpressionTree[] groupByExpressions, @Nullable FilterQueryTree rootFilterNode,
-      @Nullable Map<String, String> debugOptions) {
+      AggregationFunctionColumnPair[] aggregationFunctionColumnPairs, @Nullable ExpressionContext[] groupByExpressions,
+      @Nullable FilterContext filter, @Nullable Map<String, String> debugOptions) {
     Set<String> projectionColumns = new HashSet<>();
     for (AggregationFunctionColumnPair aggregationFunctionColumnPair : aggregationFunctionColumnPairs) {
       projectionColumns.add(aggregationFunctionColumnPair.toColumnName());
     }
     Set<String> groupByColumns;
     if (groupByExpressions != null) {
-      _groupByExpressions = new HashSet<>(Arrays.asList(groupByExpressions));
+      _groupByExpressions = Arrays.asList(groupByExpressions);
       groupByColumns = new HashSet<>();
-      for (TransformExpressionTree groupByExpression : groupByExpressions) {
+      for (ExpressionContext groupByExpression : groupByExpressions) {
         groupByExpression.getColumns(groupByColumns);
       }
       projectionColumns.addAll(groupByColumns);
     } else {
-      _groupByExpressions = Collections.emptySet();
+      _groupByExpressions = Collections.emptyList();
       groupByColumns = null;
     }
     _starTreeProjectionPlanNode =
-        new StarTreeProjectionPlanNode(starTreeV2, projectionColumns, rootFilterNode, groupByColumns, debugOptions);
+        new StarTreeProjectionPlanNode(starTreeV2, projectionColumns, filter, groupByColumns, debugOptions);
   }
 
   @Override
@@ -70,14 +66,5 @@ public class StarTreeTransformPlanNode implements PlanNode {
     //       - They are all columns (not functions or constants), where no transform is required
     //       - We never call TransformOperator.getResultMetadata() or TransformOperator.getDictionary() on them
     return new TransformOperator(_starTreeProjectionPlanNode.run(), _groupByExpressions);
-  }
-
-  @Override
-  public void showTree(String prefix) {
-    LOGGER.debug(prefix + "StarTree Transform Plan Node:");
-    LOGGER.debug(prefix + "Operator: TransformOperator");
-    LOGGER.debug(prefix + "Argument 0: Group-by Expressions - " + _groupByExpressions);
-    LOGGER.debug(prefix + "Argument 1: StarTreeProjectionPlanNode -");
-    _starTreeProjectionPlanNode.showTree(prefix + "    ");
   }
 }

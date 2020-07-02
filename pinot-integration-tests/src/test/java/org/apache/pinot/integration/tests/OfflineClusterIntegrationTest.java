@@ -318,6 +318,43 @@ public class OfflineClusterIntegrationTest extends BaseClusterIntegrationTestSet
   }
 
   @Test
+  public void testLiteralOnlyFunc()
+      throws Exception {
+    long currentTsMin = System.currentTimeMillis();
+    String sqlQuery = "SELECT 1, now() as currentTs, 'abc', toDateTime(now(), 'yyyy-MM-dd z') as today, now()";
+    JsonNode response = postSqlQuery(sqlQuery, _brokerBaseApiUrl);
+    long currentTsMax = System.currentTimeMillis();
+
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnNames").get(0).asText(), "1");
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnNames").get(1).asText(), "currentTs");
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnNames").get(2).asText(), "abc");
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnNames").get(3).asText(), "today");
+    String nowColumnName = response.get("resultTable").get("dataSchema").get("columnNames").get(4).asText();
+    assertTrue(Long.parseLong(nowColumnName) > currentTsMin);
+    assertTrue(Long.parseLong(nowColumnName) < currentTsMax);
+
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnDataTypes").get(0).asText(), "LONG");
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnDataTypes").get(1).asText(), "LONG");
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnDataTypes").get(2).asText(), "STRING");
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnDataTypes").get(3).asText(), "STRING");
+    assertEquals(response.get("resultTable").get("dataSchema").get("columnDataTypes").get(4).asText(), "LONG");
+
+    int first = response.get("resultTable").get("rows").get(0).get(0).asInt();
+    long second = response.get("resultTable").get("rows").get(0).get(1).asLong();
+    String third = response.get("resultTable").get("rows").get(0).get(2).asText();
+    assertEquals(first, 1);
+    assertTrue(second > currentTsMin);
+    assertTrue(second < currentTsMax);
+    assertEquals(third, "abc");
+    String todayStr = response.get("resultTable").get("rows").get(0).get(3).asText();
+    String expectedTodayStr =
+        Instant.now().atZone(ZoneId.of("UTC")).format(DateTimeFormatter.ofPattern("yyyy-MM-dd z"));
+    assertEquals(todayStr, expectedTodayStr);
+    long nowValue = response.get("resultTable").get("rows").get(0).get(4).asLong();
+    assertEquals(nowValue, Long.parseLong(nowColumnName));
+  }
+
+  @Test
   public void testRangeIndexTriggering()
       throws Exception {
     long numTotalDocs = getCountStarResult();
@@ -905,7 +942,7 @@ public class OfflineClusterIntegrationTest extends BaseClusterIntegrationTestSet
     assertEquals(numInstances, getNumBrokers() + getNumServers() + 1);
 
     // Try to delete a server that does not exist
-    String deleteInstanceRequest = _controllerRequestURLBuilder.forInstanceDelete("potato");
+    String deleteInstanceRequest = _controllerRequestURLBuilder.forInstance("potato");
     try {
       sendDeleteRequest(deleteInstanceRequest);
       fail("Delete should have returned a failure status (404)");
@@ -926,7 +963,7 @@ public class OfflineClusterIntegrationTest extends BaseClusterIntegrationTestSet
     }
 
     // Try to delete a live server
-    deleteInstanceRequest = _controllerRequestURLBuilder.forInstanceDelete(serverName);
+    deleteInstanceRequest = _controllerRequestURLBuilder.forInstance(serverName);
     try {
       sendDeleteRequest(deleteInstanceRequest);
       fail("Delete should have returned a failure status (409)");
@@ -954,7 +991,7 @@ public class OfflineClusterIntegrationTest extends BaseClusterIntegrationTestSet
 
     // Try to delete a broker whose information is still live
     try {
-      deleteInstanceRequest = _controllerRequestURLBuilder.forInstanceDelete(brokerName);
+      deleteInstanceRequest = _controllerRequestURLBuilder.forInstance(brokerName);
       sendDeleteRequest(deleteInstanceRequest);
       fail("Delete should have returned a failure status (409)");
     } catch (IOException e) {
@@ -1032,5 +1069,33 @@ public class OfflineClusterIntegrationTest extends BaseClusterIntegrationTestSet
       }
       return true;
     }, 10_000L, "Failed to get results for case-insensitive queries");
+  }
+
+  @Test
+  public void testDistinctCountHll()
+      throws Exception {
+    String query;
+
+    // The Accurate value is 6538.
+    query = "SELECT distinctCount(FlightNum) FROM mytable ";
+    assertEquals(postQuery(query).get("aggregationResults").get(0).get("value").asLong(), 6538);
+    assertEquals(postSqlQuery(query, _brokerBaseApiUrl).get("resultTable").get("rows").get(0).get(0).asLong(), 6538);
+
+    // Expected distinctCountHll with different log2m value from 2 to 19. The Accurate value is 6538.
+    long[] expectedResults =
+        new long[]{3504, 6347, 8877, 9729, 9046, 7672, 7538, 6993, 6649, 6651, 6553, 6525, 6459, 6523, 6532, 6544, 6538, 6539};
+
+    for (int i = 2; i < 20; i++) {
+      query = String.format("SELECT distinctCountHLL(FlightNum, %d) FROM mytable ", i);
+      assertEquals(postQuery(query).get("aggregationResults").get(0).get("value").asLong(), expectedResults[i - 2]);
+      assertEquals(postSqlQuery(query, _brokerBaseApiUrl).get("resultTable").get("rows").get(0).get(0).asLong(),
+          expectedResults[i - 2]);
+    }
+
+    // Default HLL is set as log2m=12
+    query = "SELECT distinctCountHLL(FlightNum) FROM mytable ";
+    assertEquals(postQuery(query).get("aggregationResults").get(0).get("value").asLong(), expectedResults[10]);
+    assertEquals(postSqlQuery(query, _brokerBaseApiUrl).get("resultTable").get("rows").get(0).get(0).asLong(),
+        expectedResults[10]);
   }
 }
