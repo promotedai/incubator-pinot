@@ -18,15 +18,18 @@
  */
 package org.apache.pinot.server.starter.helix;
 
-import com.google.common.base.Preconditions;
 import java.io.File;
+import java.util.UUID;
 import java.util.concurrent.locks.Lock;
+
 import javax.annotation.Nullable;
-import org.apache.commons.configuration.Configuration;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.common.Utils;
 import org.apache.pinot.common.metadata.ZKMetadataProvider;
 import org.apache.pinot.common.metadata.segment.OfflineSegmentZKMetadata;
+import org.apache.pinot.common.metrics.ServerMeter;
+import org.apache.pinot.common.metrics.ServerMetrics;
 import org.apache.pinot.common.utils.CommonConstants;
 import org.apache.pinot.common.utils.TarGzCompressionUtils;
 import org.apache.pinot.common.utils.fetcher.SegmentFetcherFactory;
@@ -37,9 +40,13 @@ import org.apache.pinot.core.segment.index.metadata.SegmentMetadata;
 import org.apache.pinot.core.segment.index.metadata.SegmentMetadataImpl;
 import org.apache.pinot.spi.crypt.PinotCrypter;
 import org.apache.pinot.spi.crypt.PinotCrypterFactory;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.filesystem.PinotFSFactory;
+import org.apache.pinot.spi.utils.retry.AttemptsExceededException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Preconditions;
 
 
 public class SegmentFetcherAndLoader {
@@ -49,15 +56,17 @@ public class SegmentFetcherAndLoader {
   private static final String ENCODED_SUFFIX = ".enc";
 
   private final InstanceDataManager _instanceDataManager;
+  private final ServerMetrics _serverMetrics;
 
-  public SegmentFetcherAndLoader(Configuration config, InstanceDataManager instanceDataManager)
+  public SegmentFetcherAndLoader(PinotConfiguration config, InstanceDataManager instanceDataManager, ServerMetrics serverMetrics)
       throws Exception {
     _instanceDataManager = instanceDataManager;
+    _serverMetrics = serverMetrics;
 
-    Configuration pinotFSConfig = config.subset(CommonConstants.Server.PREFIX_OF_CONFIG_OF_PINOT_FS_FACTORY);
-    Configuration segmentFetcherFactoryConfig =
+    PinotConfiguration pinotFSConfig = config.subset(CommonConstants.Server.PREFIX_OF_CONFIG_OF_PINOT_FS_FACTORY);
+    PinotConfiguration segmentFetcherFactoryConfig =
         config.subset(CommonConstants.Server.PREFIX_OF_CONFIG_OF_SEGMENT_FETCHER_FACTORY);
-    Configuration pinotCrypterConfig = config.subset(CommonConstants.Server.PREFIX_OF_CONFIG_OF_PINOT_CRYPTER);
+    PinotConfiguration pinotCrypterConfig = config.subset(CommonConstants.Server.PREFIX_OF_CONFIG_OF_PINOT_CRYPTER);
 
     PinotFSFactory.init(pinotFSConfig);
     SegmentFetcherFactory.init(segmentFetcherFactoryConfig);
@@ -181,39 +190,48 @@ public class SegmentFetcherAndLoader {
   private String downloadSegmentToLocal(String uri, PinotCrypter crypter, String tableName, String segmentName)
       throws Exception {
     File tempDir = new File(new File(_instanceDataManager.getSegmentFileDirectory(), tableName),
-        "tmp_" + segmentName + "_" + System.nanoTime());
+        "tmp-" + segmentName + "-" + UUID.randomUUID());
     FileUtils.forceMkdir(tempDir);
     File tempDownloadFile = new File(tempDir, segmentName + ENCODED_SUFFIX);
     File tempTarFile = new File(tempDir, segmentName + TAR_GZ_SUFFIX);
     File tempSegmentDir = new File(tempDir, segmentName);
     try {
-      SegmentFetcherFactory.fetchSegmentToLocal(uri, tempDownloadFile);
-      if (crypter != null) {
-        crypter.decrypt(tempDownloadFile, tempTarFile);
-      } else {
-        tempTarFile = tempDownloadFile;
+      try {
+        SegmentFetcherFactory.fetchSegmentToLocal(uri, tempDownloadFile);
+        if (crypter != null) {
+          crypter.decrypt(tempDownloadFile, tempTarFile);
+        } else {
+          tempTarFile = tempDownloadFile;
+        }
+        LOGGER.info("Downloaded tarred segment: {} for table: {} from: {} to: {}, file length: {}", segmentName,
+            tableName, uri, tempTarFile, tempTarFile.length());
+      } catch (AttemptsExceededException e) {
+        LOGGER.error("Attempts exceeded when downloading segment: {} for table: {} from: {} to: {}", segmentName,
+            tableName, uri, tempTarFile);
+        _serverMetrics.addMeteredTableValue(tableName, ServerMeter.SEGMENT_DOWNLOAD_FAILURES, 1L);
+        Utils.rethrowException(e);
+        return null;
       }
 
-      LOGGER
-          .info("Downloaded tarred segment: {} for table: {} from: {} to: {}, file length: {}", segmentName, tableName,
-              uri, tempTarFile, tempTarFile.length());
-
-      // If an exception is thrown when untarring, it means the tar file is broken OR not found after the retry.
-      // Thus, there's no need to retry again.
-      TarGzCompressionUtils.unTar(tempTarFile, tempSegmentDir);
-
-      File[] files = tempSegmentDir.listFiles();
-      Preconditions.checkState(files != null && files.length == 1);
-      File tempIndexDir = files[0];
-
-      File indexDir = new File(new File(_instanceDataManager.getSegmentDataDirectory(), tableName), segmentName);
-      if (indexDir.exists()) {
-        LOGGER.info("Deleting existing index directory for segment: {} for table: {}", segmentName, tableName);
-        FileUtils.deleteDirectory(indexDir);
+      try {
+        // If an exception is thrown when untarring, it means the tar file is broken OR not found after the retry.
+        // Thus, there's no need to retry again.
+        File tempIndexDir = TarGzCompressionUtils.untar(tempTarFile, tempSegmentDir).get(0);
+        File indexDir = new File(new File(_instanceDataManager.getSegmentDataDirectory(), tableName), segmentName);
+        if (indexDir.exists()) {
+          LOGGER.info("Deleting existing index directory for segment: {} for table: {}", segmentName, tableName);
+          FileUtils.deleteDirectory(indexDir);
+        }
+        FileUtils.moveDirectory(tempIndexDir, indexDir);
+        LOGGER.info("Successfully downloaded segment: {} for table: {} to: {}", segmentName, tableName, indexDir);
+        return indexDir.getAbsolutePath();
+      } catch (Exception e) {
+        LOGGER.error("Exception when untarring segment: {} for table: {} from {} to {}", segmentName, tableName,
+            tempTarFile, tempSegmentDir);
+        _serverMetrics.addMeteredTableValue(tableName, ServerMeter.UNTAR_FAILURES, 1L);
+        Utils.rethrowException(e);
+        return null;
       }
-      FileUtils.moveDirectory(tempIndexDir, indexDir);
-      LOGGER.info("Successfully downloaded segment: {} for table: {} to: {}", segmentName, tableName, indexDir);
-      return indexDir.getAbsolutePath();
     } finally {
       FileUtils.deleteQuietly(tempDir);
     }

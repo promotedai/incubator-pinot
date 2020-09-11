@@ -19,9 +19,12 @@
 package org.apache.pinot.controller.api;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.net.UnknownHostException;
+import java.util.Collection;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -31,6 +34,7 @@ import javax.ws.rs.container.ContainerResponseFilter;
 
 import org.apache.pinot.controller.api.listeners.ListenerConfig;
 import org.apache.pinot.controller.api.listeners.TlsConfiguration;
+import org.apache.pinot.common.utils.CommonConstants;
 import org.glassfish.grizzly.http.server.CLStaticHttpHandler;
 import org.glassfish.grizzly.http.server.HttpServer;
 import org.glassfish.grizzly.http.server.NetworkListener;
@@ -56,10 +60,10 @@ public class ControllerAdminApiApplication extends ResourceConfig {
 
   private HttpServer _httpServer;
   private static final String RESOURCE_PACKAGE = "org.apache.pinot.controller.api.resources";
-  
+
   public ControllerAdminApiApplication() {
     super();
-    
+
     packages(RESOURCE_PACKAGE);
     // TODO See ControllerResponseFilter
 //    register(new LoggingFeature());
@@ -87,7 +91,7 @@ public class ControllerAdminApiApplication extends ResourceConfig {
   public void registerBinder(AbstractBinder binder) {
     register(binder);
   }
-  
+
   private void configureListener(ListenerConfig listenerConfig, HttpServer httpServer) {
     final NetworkListener listener = new NetworkListener(listenerConfig.getName() + "-" + listenerConfig.getPort(),
         listenerConfig.getHost(), listenerConfig.getPort());
@@ -103,25 +107,25 @@ public class ControllerAdminApiApplication extends ResourceConfig {
     httpServer.addListener(listener);
   }
 
-  public void start(List<ListenerConfig> listenerConfigs, boolean advertiseHttps) {
+  public void start(List<ListenerConfig> listenerConfigs) {
     // ideally greater than reserved port but then port 80 is also valid
     Preconditions.checkNotNull(listenerConfigs);
-    
+
     // The URI is irrelevant since the default listener will be manually rewritten.
     _httpServer = GrizzlyHttpServerFactory.createHttpServer(URI.create("http://0.0.0.0/"), this, false);
-    
+
     // Listeners cannot be configured with the factory. Manual overrides is required as instructed by Javadoc.
     _httpServer.removeListener("grizzly");
 
     listenerConfigs.forEach(listenerConfig->configureListener(listenerConfig, _httpServer));
-    
+
     try {
       _httpServer.start();
     } catch (IOException e) {
       throw new RuntimeException("Failed to start Http Server", e);
     }
-    
-    setupSwagger(_httpServer, advertiseHttps);
+
+    setupSwagger(_httpServer);
 
     ClassLoader classLoader = ControllerAdminApiApplication.class.getClassLoader();
 
@@ -131,28 +135,20 @@ public class ControllerAdminApiApplication extends ResourceConfig {
     // So, we setup specific handlers for static resource directory. index.html is served directly
     // by a jersey handler
 
-    _httpServer.getServerConfiguration()
-        .addHttpHandler(new CLStaticHttpHandler(classLoader, "/static/query/"), "/query/");
-    _httpServer.getServerConfiguration().addHttpHandler(new CLStaticHttpHandler(classLoader, "/static/css/"), "/css/");
-    _httpServer.getServerConfiguration().addHttpHandler(new CLStaticHttpHandler(classLoader, "/static/js/"), "/js/");
-    // without this explicit request to /index.html will not work
-    _httpServer.getServerConfiguration().addHttpHandler(new CLStaticHttpHandler(classLoader, "/static/"), "/index.html");
+    _httpServer.getServerConfiguration().addHttpHandler(new CLStaticHttpHandler(classLoader, "/webapp/"), "/index.html");
+    _httpServer.getServerConfiguration().addHttpHandler(new CLStaticHttpHandler(classLoader, "/webapp/js/"), "/js/");
 
     LOGGER.info("Admin API started on ports: {}", listenerConfigs.stream().map(ListenerConfig::getPort)
         .map(port -> port.toString()).collect(Collectors.joining(",")));
   }
 
-  private void setupSwagger(HttpServer httpServer, boolean advertiseHttps) {
+  private void setupSwagger(HttpServer httpServer) {
     BeanConfig beanConfig = new BeanConfig();
     beanConfig.setTitle("Pinot Controller API");
     beanConfig.setDescription("APIs for accessing Pinot Controller information");
     beanConfig.setContact("https://github.com/apache/incubator-pinot");
     beanConfig.setVersion("1.0");
-    if (advertiseHttps) {
-      beanConfig.setSchemes(new String[]{"https"});
-    } else {
-      beanConfig.setSchemes(new String[]{"http"});
-    }
+    beanConfig.setSchemes(new String[]{CommonConstants.HTTP_PROTOCOL, CommonConstants.HTTPS_PROTOCOL});
     beanConfig.setBasePath("/");
     beanConfig.setResourcePackage(RESOURCE_PACKAGE);
     beanConfig.setScan(true);
@@ -163,7 +159,7 @@ public class ControllerAdminApiApplication extends ResourceConfig {
     httpServer.getServerConfiguration().addHttpHandler(apiStaticHttpHandler, "/api/");
     httpServer.getServerConfiguration().addHttpHandler(apiStaticHttpHandler, "/help/");
 
-    URL swaggerDistLocation = loader.getResource("META-INF/resources/webjars/swagger-ui/2.2.2/");
+    URL swaggerDistLocation = loader.getResource("META-INF/resources/webjars/swagger-ui/3.18.2/");
     CLStaticHttpHandler swaggerDist = new CLStaticHttpHandler(new URLClassLoader(new URL[]{swaggerDistLocation}));
     httpServer.getServerConfiguration().addHttpHandler(swaggerDist, "/swaggerui-dist/");
   }
@@ -174,7 +170,7 @@ public class ControllerAdminApiApplication extends ResourceConfig {
     }
     _httpServer.shutdownNow();
   }
-  
+
   private class CorsFilter implements ContainerResponseFilter {
     @Override
     public void filter(ContainerRequestContext containerRequestContext,

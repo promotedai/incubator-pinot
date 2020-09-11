@@ -26,6 +26,7 @@ import java.net.URLClassLoader;
 import org.apache.pinot.broker.requesthandler.BrokerRequestHandler;
 import org.apache.pinot.broker.routing.RoutingManager;
 import org.apache.pinot.common.metrics.BrokerMetrics;
+import org.apache.pinot.common.utils.CommonConstants;
 import org.glassfish.grizzly.http.server.CLStaticHttpHandler;
 import org.glassfish.grizzly.http.server.HttpHandler;
 import org.glassfish.grizzly.http.server.HttpServer;
@@ -70,7 +71,7 @@ public class BrokerAdminApiApplication extends ResourceConfig {
     beanConfig.setDescription("APIs for accessing Pinot broker information");
     beanConfig.setContact("https://github.com/apache/incubator-pinot");
     beanConfig.setVersion("1.0");
-    beanConfig.setSchemes(new String[]{"http"});
+    beanConfig.setSchemes(new String[]{CommonConstants.HTTP_PROTOCOL, CommonConstants.HTTPS_PROTOCOL});
     beanConfig.setBasePath(_baseUri.getPath());
     beanConfig.setResourcePackage(RESOURCE_PACKAGE);
     beanConfig.setScan(true);
@@ -80,7 +81,7 @@ public class BrokerAdminApiApplication extends ResourceConfig {
     _httpServer.getServerConfiguration().addHttpHandler(httpHandler, "/api/", "/help/");
 
     URL swaggerDistLocation =
-        BrokerAdminApiApplication.class.getClassLoader().getResource("META-INF/resources/webjars/swagger-ui/2.2.2/");
+        BrokerAdminApiApplication.class.getClassLoader().getResource("META-INF/resources/webjars/swagger-ui/3.18.2/");
     CLStaticHttpHandler swaggerDist = new CLStaticHttpHandler(new URLClassLoader(new URL[]{swaggerDistLocation}));
     _httpServer.getServerConfiguration().addHttpHandler(swaggerDist, "/swaggerui-dist/");
   }

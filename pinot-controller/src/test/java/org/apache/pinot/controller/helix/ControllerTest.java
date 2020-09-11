@@ -18,7 +18,15 @@
  */
 package org.apache.pinot.controller.helix;
 
-import com.google.common.base.Preconditions;
+import static org.apache.pinot.common.utils.CommonConstants.Helix.LEAD_CONTROLLER_RESOURCE_ENABLED_KEY;
+import static org.apache.pinot.common.utils.CommonConstants.Helix.LEAD_CONTROLLER_RESOURCE_NAME;
+import static org.apache.pinot.common.utils.CommonConstants.Helix.UNTAGGED_BROKER_INSTANCE;
+import static org.apache.pinot.common.utils.CommonConstants.Helix.UNTAGGED_SERVER_INSTANCE;
+import static org.apache.pinot.common.utils.CommonConstants.Helix.Instance.ADMIN_PORT_KEY;
+import static org.apache.pinot.common.utils.CommonConstants.Server.DEFAULT_ADMIN_API_PORT;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
+
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
@@ -31,8 +39,10 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+
 import org.apache.commons.httpclient.HttpClient;
 import org.apache.commons.httpclient.methods.PostMethod;
 import org.apache.commons.httpclient.methods.PutMethod;
@@ -69,6 +79,7 @@ import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.config.tenant.Tenant;
 import org.apache.pinot.spi.config.tenant.TenantRole;
+import org.apache.pinot.spi.data.DateTimeFieldSpec;
 import org.apache.pinot.spi.data.DimensionFieldSpec;
 import org.apache.pinot.spi.data.FieldSpec;
 import org.apache.pinot.spi.data.MetricFieldSpec;
@@ -78,14 +89,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testng.Assert;
 
-import static org.apache.pinot.common.utils.CommonConstants.Helix.Instance.ADMIN_PORT_KEY;
-import static org.apache.pinot.common.utils.CommonConstants.Helix.LEAD_CONTROLLER_RESOURCE_ENABLED_KEY;
-import static org.apache.pinot.common.utils.CommonConstants.Helix.LEAD_CONTROLLER_RESOURCE_NAME;
-import static org.apache.pinot.common.utils.CommonConstants.Helix.UNTAGGED_BROKER_INSTANCE;
-import static org.apache.pinot.common.utils.CommonConstants.Helix.UNTAGGED_SERVER_INSTANCE;
-import static org.apache.pinot.common.utils.CommonConstants.Server.DEFAULT_ADMIN_API_PORT;
-import static org.testng.Assert.assertEquals;
-import static org.testng.Assert.assertNotNull;
+import com.google.common.base.Preconditions;
 
 
 /**
@@ -135,23 +139,26 @@ public abstract class ControllerTest {
     }
   }
 
-  public ControllerConf getDefaultControllerConfiguration() {
-    ControllerConf config = new ControllerConf();
-    config.setControllerHost(LOCAL_HOST);
-    config.setControllerPort(Integer.toString(DEFAULT_CONTROLLER_PORT));
-    config.setDataDir(DEFAULT_DATA_DIR);
-    config.setZkStr(ZkStarter.DEFAULT_ZK_STR);
-    config.setHelixClusterName(getHelixClusterName());
+  public Map<String, Object> getDefaultControllerConfiguration() {
+    Map<String, Object> properties = new HashMap<>();
+    
+    properties.put(ControllerConf.CONTROLLER_HOST, LOCAL_HOST);
+    properties.put(ControllerConf.CONTROLLER_PORT, DEFAULT_CONTROLLER_PORT);
+    properties.put(ControllerConf.DATA_DIR, DEFAULT_DATA_DIR);
+    properties.put(ControllerConf.ZK_STR, ZkStarter.DEFAULT_ZK_STR);
+    properties.put(ControllerConf.HELIX_CLUSTER_NAME, getHelixClusterName());
 
-    return config;
+    return properties;
   }
 
   protected void startController() {
     startController(getDefaultControllerConfiguration());
   }
 
-  protected void startController(ControllerConf config) {
+  protected void startController(Map<String, Object> properties) {
     Preconditions.checkState(_controllerStarter == null);
+    
+    ControllerConf config = new ControllerConf(properties);
 
     _controllerPort = Integer.valueOf(config.getControllerPort());
     _controllerBaseApiUrl = "http://localhost:" + _controllerPort;
@@ -390,15 +397,24 @@ public abstract class ControllerTest {
     _fakeInstanceHelixManagers.clear();
   }
 
+  protected void stopFakeInstance(String instanceId) {
+    for (HelixManager helixManager : _fakeInstanceHelixManagers) {
+      if (helixManager.getInstanceName().equalsIgnoreCase(instanceId)) {
+        helixManager.disconnect();
+        _fakeInstanceHelixManagers.remove(helixManager);
+        return;
+      }
+    }
+  }
+
   protected Schema createDummySchema(String tableName) {
     Schema schema = new Schema();
     schema.setSchemaName(tableName);
     schema.addField(new DimensionFieldSpec("dimA", FieldSpec.DataType.STRING, true, ""));
     schema.addField(new DimensionFieldSpec("dimB", FieldSpec.DataType.STRING, true, 0));
-
     schema.addField(new MetricFieldSpec("metricA", FieldSpec.DataType.INT, 0));
     schema.addField(new MetricFieldSpec("metricB", FieldSpec.DataType.DOUBLE, -1));
-
+    schema.addField(new DateTimeFieldSpec("timeColumn", FieldSpec.DataType.LONG, "1:MILLISECONDS:EPOCH", "1:DAYS"));
     return schema;
   }
 
@@ -560,6 +576,14 @@ public abstract class ControllerTest {
       writer.flush();
     }
 
+    return constructResponse(httpConnection.getInputStream());
+  }
+
+  public static String sendPutRequest(String urlString)
+      throws IOException {
+    HttpURLConnection httpConnection = (HttpURLConnection) new URL(urlString).openConnection();
+    httpConnection.setDoOutput(true);
+    httpConnection.setRequestMethod("PUT");
     return constructResponse(httpConnection.getInputStream());
   }
 

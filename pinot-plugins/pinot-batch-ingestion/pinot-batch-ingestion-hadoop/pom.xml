@@ -26,7 +26,7 @@
   <parent>
     <artifactId>pinot-batch-ingestion</artifactId>
     <groupId>org.apache.pinot</groupId>
-    <version>${revision}${sha1}</version>
+    <version>0.5.0-SNAPSHOT</version>
     <relativePath>..</relativePath>
   </parent>
 
@@ -36,6 +36,7 @@
   <properties>
     <pinot.root>${basedir}/../../..</pinot.root>
     <hadoop.version>2.7.0</hadoop.version>
+    <phase.prop>package</phase.prop>
   </properties>
   <dependencies>
     <dependency>

@@ -20,6 +20,7 @@ package org.apache.pinot.core.data.manager.realtime;
 
 import java.io.File;
 import java.net.URI;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -36,10 +37,12 @@ import org.slf4j.LoggerFactory;
 /**
  * A segment uploader which does segment upload to a segment store (with store root dir configured as
  * _segmentStoreUriStr) using PinotFS within a configurable timeout period. The final segment location would be in the
- * URI _segmentStoreUriStr/_tableNameWithType/segmentName if successful.
+ * URI _segmentStoreUriStr/_tableNameWithType/segmentName+random_uuid if successful.
  */
 public class PinotFSSegmentUploader implements SegmentUploader {
   private Logger LOGGER = LoggerFactory.getLogger(PinotFSSegmentUploader.class);
+  public static final int DEFAULT_SEGMENT_UPLOAD_TIMEOUT_MILLIS = 10 * 1000;
+
   private String _segmentStoreUriStr;
   private ExecutorService _executorService = Executors.newCachedThreadPool();
   private int _timeoutInMs;
@@ -55,7 +58,7 @@ public class PinotFSSegmentUploader implements SegmentUploader {
     }
     Callable<URI> uploadTask = () -> {
       URI destUri = new URI(StringUtil
-          .join(File.separator, _segmentStoreUriStr, segmentName.getTableName(), segmentName.getSegmentName()));
+          .join(File.separator, _segmentStoreUriStr, segmentName.getTableName(), segmentName.getSegmentName() + UUID.randomUUID().toString()));
       try {
         PinotFS pinotFS = PinotFSFactory.create(new URI(_segmentStoreUriStr).getScheme());
         // Check and delete any existing segment file.
@@ -72,6 +75,7 @@ public class PinotFSSegmentUploader implements SegmentUploader {
     Future<URI> future = _executorService.submit(uploadTask);
     try {
       URI segmentLocation = future.get(_timeoutInMs, TimeUnit.MILLISECONDS);
+      LOGGER.info("Successfully upload segment {} to {}.", segmentName, segmentLocation);
       return segmentLocation;
     } catch (InterruptedException e) {
       LOGGER.info("Interrupted while waiting for segment upload of {} to {}.", segmentName, _segmentStoreUriStr);

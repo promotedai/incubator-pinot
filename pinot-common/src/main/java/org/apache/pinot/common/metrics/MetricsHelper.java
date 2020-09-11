@@ -30,11 +30,13 @@ import com.yammer.metrics.core.Sampling;
 import com.yammer.metrics.core.Stoppable;
 import com.yammer.metrics.core.Timer;
 import java.lang.reflect.Constructor;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import org.apache.commons.configuration.Configuration;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,23 +44,20 @@ import org.slf4j.LoggerFactory;
 public class MetricsHelper {
   private static final Logger LOGGER = LoggerFactory.getLogger(MetricsHelper.class);
 
-  private static Map<MetricsRegistry, Object> metricsRegistryMap = new WeakHashMap<MetricsRegistry, Object>();
+  private static Map<MetricsRegistry, Boolean> metricsRegistryMap = new ConcurrentHashMap<>();
 
-  private static Map<MetricsRegistryRegistrationListener, Object> metricsRegistryRegistrationListenersMap =
-      new WeakHashMap<MetricsRegistryRegistrationListener, Object>();
+  private static Map<MetricsRegistryRegistrationListener, Boolean> metricsRegistryRegistrationListenersMap =
+      new ConcurrentHashMap<>();
 
   /**
    * Initializes the metrics system by initializing the registry registration listeners present in the configuration.
    *
    * @param configuration The subset of the configuration containing the metrics-related keys
    */
-  public static void initializeMetrics(Configuration configuration) {
+  public static void initializeMetrics(PinotConfiguration configuration) {
     synchronized (MetricsHelper.class) {
-      String[] listenerClassNames = configuration.getStringArray("metricsRegistryRegistrationListeners");
-
-      if (listenerClassNames.length < 1) {
-        listenerClassNames = new String[]{JmxReporterMetricsRegistryRegistrationListener.class.getName()};
-      }
+      List<String> listenerClassNames = configuration.getProperty("metricsRegistryRegistrationListeners",
+          Arrays.asList(JmxReporterMetricsRegistryRegistrationListener.class.getName()));
 
       // Build each listener using their default constructor and add them
       for (String listenerClassName : listenerClassNames) {
@@ -69,6 +68,7 @@ public class MetricsHelper {
               clazz.getDeclaredConstructor();
           MetricsRegistryRegistrationListener listener = defaultConstructor.newInstance();
 
+          LOGGER.info("Registering metricsRegistry to listener {}", listenerClassName);
           addMetricsRegistryRegistrationListener(listener);
         } catch (Exception e) {
           LOGGER
@@ -76,6 +76,7 @@ public class MetricsHelper {
         }
       }
     }
+    LOGGER.info("Number of listeners got registered: {}", metricsRegistryRegistrationListenersMap.size());
   }
 
   /**
@@ -87,10 +88,11 @@ public class MetricsHelper {
    */
   public static void addMetricsRegistryRegistrationListener(MetricsRegistryRegistrationListener listener) {
     synchronized (MetricsHelper.class) {
-      metricsRegistryRegistrationListenersMap.put(listener, null);
+      metricsRegistryRegistrationListenersMap.put(listener, Boolean.TRUE);
 
       // Fire events to register all previously registered metrics registries
       Set<MetricsRegistry> metricsRegistries = metricsRegistryMap.keySet();
+      LOGGER.info("Number of metrics registry: {}", metricsRegistries.size());
       for (MetricsRegistry metricsRegistry : metricsRegistries) {
         listener.onMetricsRegistryRegistered(metricsRegistry);
       }
@@ -104,7 +106,7 @@ public class MetricsHelper {
    */
   public static void registerMetricsRegistry(MetricsRegistry registry) {
     synchronized (MetricsHelper.class) {
-      metricsRegistryMap.put(registry, null);
+      metricsRegistryMap.put(registry, Boolean.TRUE);
 
       // Fire event to all registered listeners
       Set<MetricsRegistryRegistrationListener> metricsRegistryRegistrationListeners =

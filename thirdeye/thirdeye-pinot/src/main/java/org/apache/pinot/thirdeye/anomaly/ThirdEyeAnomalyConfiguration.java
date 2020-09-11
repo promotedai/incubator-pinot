@@ -25,37 +25,43 @@ import org.apache.pinot.thirdeye.anomaly.task.TaskDriverConfiguration;
 import org.apache.pinot.thirdeye.auto.onboard.AutoOnboardConfiguration;
 import org.apache.pinot.thirdeye.common.ThirdEyeConfiguration;
 import java.util.List;
+import org.apache.pinot.thirdeye.common.restclient.ThirdEyeRestClientConfiguration;
 
 
 public class ThirdEyeAnomalyConfiguration extends ThirdEyeConfiguration {
 
   private boolean alert = false;
   private boolean autoload = false;
-  private boolean classifier = false;
-  private boolean dataCompleteness = false;
   private boolean holidayEventsLoader = false;
   private boolean mockEventsLoader = false;
   private boolean monitor = false;
   private boolean pinotProxy = false;
   private boolean scheduler = false;
   private boolean worker = false;
+  private boolean onlineWorker = false;
   private boolean detectionPipeline = false;
   private boolean detectionAlert = false;
   private boolean dataAvailabilityEventListener = false;
   private boolean dataAvailabilityTaskScheduler = false;
 
   private long id;
-  private String dashboardHost;
   private HolidayEventsLoaderConfiguration holidayEventsLoaderConfiguration = new HolidayEventsLoaderConfiguration();
   private MockEventsLoaderConfiguration mockEventsLoaderConfiguration = new MockEventsLoaderConfiguration();
   private MonitorConfiguration monitorConfiguration = new MonitorConfiguration();
   private AutoOnboardConfiguration autoOnboardConfiguration = new AutoOnboardConfiguration();
   private TaskDriverConfiguration taskDriverConfiguration = new TaskDriverConfiguration();
+  private ThirdEyeRestClientConfiguration teRestConfig = new ThirdEyeRestClientConfiguration();
   private DataAvailabilitySchedulingConfiguration
       dataAvailabilitySchedulingConfiguration = new DataAvailabilitySchedulingConfiguration();
-  private String failureFromAddress;
-  private String failureToAddress;
   private List<String> holidayCountriesWhitelist;
+
+  public ThirdEyeRestClientConfiguration getThirdEyeRestClientConfiguration() {
+    return teRestConfig;
+  }
+
+  public void setThirdEyeRestClientConfiguration(ThirdEyeRestClientConfiguration teRestConfig) {
+    this.teRestConfig = teRestConfig;
+  }
 
   public HolidayEventsLoaderConfiguration getHolidayEventsLoaderConfiguration() {
     return holidayEventsLoaderConfiguration;
@@ -105,14 +111,6 @@ public class ThirdEyeAnomalyConfiguration extends ThirdEyeConfiguration {
     this.holidayEventsLoader = holidayEventsLoader;
   }
 
-  public String getDashboardHost() {
-    return dashboardHost;
-  }
-
-  public void setDashboardHost(String dashboardHost) {
-    this.dashboardHost = dashboardHost;
-  }
-
   public long getId() {
     return id;
   }
@@ -135,6 +133,14 @@ public class ThirdEyeAnomalyConfiguration extends ThirdEyeConfiguration {
 
   public void setWorker(boolean worker) {
     this.worker = worker;
+  }
+
+  public boolean isOnlineWorker() {
+    return onlineWorker;
+  }
+
+  public void setOnlineWorker(boolean onlineWorker) {
+    this.onlineWorker = onlineWorker;
   }
 
   public boolean isMonitor() {
@@ -201,44 +207,12 @@ public class ThirdEyeAnomalyConfiguration extends ThirdEyeConfiguration {
     this.autoload = autoload;
   }
 
-  public boolean isDataCompleteness() {
-    return dataCompleteness;
-  }
-
-  public void setDataCompleteness(boolean dataCompleteness) {
-    this.dataCompleteness = dataCompleteness;
-  }
-
-  public boolean isClassifier() {
-    return classifier;
-  }
-
-  public void setClassifier(boolean classifier) {
-    this.classifier = classifier;
-  }
-
   public boolean isPinotProxy() {
     return pinotProxy;
   }
 
   public void setPinotProxy(boolean pinotProxy) {
     this.pinotProxy = pinotProxy;
-  }
-
-  public String getFailureFromAddress() {
-    return failureFromAddress;
-  }
-
-  public void setFailureFromAddress(String failureFromAddress) {
-    this.failureFromAddress = failureFromAddress;
-  }
-
-  public String getFailureToAddress() {
-    return failureToAddress;
-  }
-
-  public void setFailureToAddress(String failureToAddress) {
-    this.failureToAddress = failureToAddress;
   }
 
   public List<String> getHolidayCountriesWhitelist() {

@@ -110,6 +110,7 @@ create table if not exists merged_anomaly_result_index (
     base_id bigint(20) not null,
     create_time timestamp,
     update_time timestamp default current_timestamp,
+    child boolean,
     version int(10)
 ) ENGINE=InnoDB;
 create index merged_anomaly_result_function_idx on merged_anomaly_result_index(function_id);
@@ -420,3 +421,43 @@ ALTER TABLE `evaluation_index` ADD UNIQUE `evaluation_index`(`detection_config_i
 create index evaluation_base_id_idx ON evaluation_index(base_id);
 create index evaluation_detection_config_id_idx ON evaluation_index(detection_config_id);
 create index evaluation_detection_start_time_idx on evaluation_index(start_time);
+
+create table if not exists rootcause_template_index (
+    base_id bigint(20) not null,
+    `name` VARCHAR(256) not null,
+    application VARCHAR(128),
+    owner varchar(32) not null,
+    metric_id bigint(20) not null,
+    create_time timestamp default 0,
+    update_time timestamp default current_timestamp,
+    version int(10)
+) ENGINE=InnoDB;
+ALTER TABLE `rootcause_template_index` ADD UNIQUE `rootcause_template_index`(`name`);
+create index rootcause_template_id_idx ON rootcause_template_index(base_id);
+create index rootcause_template_owner_idx ON rootcause_template_index(owner);
+create index rootcause_template_metric_idx on rootcause_template_index(metric_id);
+create index rootcause_template_config_application_idx ON rootcause_template_index(`application`);
+
+create table if not exists online_detection_data_index (
+    base_id bigint(20) not null,
+    dataset varchar(200),
+    metric varchar(200),
+    create_time timestamp default 0,
+    update_time timestamp default current_timestamp,
+    version int(10)
+) ENGINE=InnoDB;
+create index online_detection_data_id_idx ON online_detection_data_index(base_id);
+create index online_detection_data_dataset_idx ON online_detection_data_index(dataset);
+create index online_detection_data_metric_idx ON online_detection_data_index(metric);
+
+create table if not exists anomaly_subscription_group_notification_index (
+    base_id bigint(20) not null,
+    anomaly_id bigint(20) not null,
+    detection_config_id bigint(20) not null,
+    create_time timestamp default 0,
+    update_time timestamp default current_timestamp,
+    version int(10)
+) ENGINE=InnoDB;
+ALTER TABLE `anomaly_subscription_group_notification_index` ADD UNIQUE `anomaly_subscription_group_notification_index`(anomaly_id);
+create index anomaly_subscription_group_anomaly_idx ON anomaly_subscription_group_notification_index(anomaly_id);
+create index anomaly_subscription_group_detection_config_idx ON anomaly_subscription_group_notification_index(anomaly_id)

@@ -38,6 +38,7 @@ import org.apache.pinot.spi.config.table.TableTaskConfig;
 import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.config.table.TagOverrideConfig;
 import org.apache.pinot.spi.config.table.TenantConfig;
+import org.apache.pinot.spi.config.table.TierConfig;
 import org.apache.pinot.spi.config.table.UpsertConfig;
 import org.apache.pinot.spi.config.table.assignment.InstanceAssignmentConfig;
 import org.apache.pinot.spi.config.table.assignment.InstancePartitionsType;
@@ -87,6 +88,7 @@ public class TableConfigBuilder {
   private List<String> _rangeIndexColumns;
   private Map<String, String> _streamConfigs;
   private SegmentPartitionConfig _segmentPartitionConfig;
+  private boolean _nullHandlingEnabled;
 
   private TableCustomConfig _customConfig;
   private QuotaConfig _quotaConfig;
@@ -98,6 +100,7 @@ public class TableConfigBuilder {
 
   private UpsertConfig _upsertConfig;
   private IngestionConfig _ingestionConfig;
+  private List<TierConfig> _tierConfigList;
 
   public TableConfigBuilder(TableType tableType) {
     _tableType = tableType;
@@ -255,6 +258,11 @@ public class TableConfigBuilder {
     return this;
   }
 
+  public TableConfigBuilder setNullHandlingEnabled(boolean nullHandlingEnabled) {
+    _nullHandlingEnabled = nullHandlingEnabled;
+    return this;
+  }
+
   public TableConfigBuilder setCustomConfig(TableCustomConfig customConfig) {
     _customConfig = customConfig;
     return this;
@@ -306,6 +314,11 @@ public class TableConfigBuilder {
     return this;
   }
 
+  public TableConfigBuilder setTierConfigList(List<TierConfig> tierConfigList) {
+    _tierConfigList = tierConfigList;
+    return this;
+  }
+
   public TableConfig build() {
     // Validation config
     SegmentsValidationAndRetentionConfig validationConfig = new SegmentsValidationAndRetentionConfig();
@@ -344,6 +357,7 @@ public class TableConfigBuilder {
     indexingConfig.setRangeIndexColumns(_rangeIndexColumns);
     indexingConfig.setStreamConfigs(_streamConfigs);
     indexingConfig.setSegmentPartitionConfig(_segmentPartitionConfig);
+    indexingConfig.setNullHandlingEnabled(_nullHandlingEnabled);
 
     if (_customConfig == null) {
       _customConfig = new TableCustomConfig(null);
@@ -351,6 +365,6 @@ public class TableConfigBuilder {
 
     return new TableConfig(_tableName, _tableType.toString(), validationConfig, tenantConfig, indexingConfig,
         _customConfig, _quotaConfig, _taskConfig, _routingConfig, _queryConfig, _instanceAssignmentConfigMap,
-        _fieldConfigList, _upsertConfig, _ingestionConfig);
+        _fieldConfigList, _upsertConfig, _ingestionConfig, _tierConfigList);
   }
 }

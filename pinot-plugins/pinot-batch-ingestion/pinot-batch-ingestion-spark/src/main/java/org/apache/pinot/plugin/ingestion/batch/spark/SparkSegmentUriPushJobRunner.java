@@ -26,9 +26,9 @@ import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import org.apache.commons.configuration.Configuration;
-import org.apache.commons.configuration.MapConfiguration;
+
 import org.apache.pinot.plugin.ingestion.batch.common.SegmentPushUtils;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.filesystem.PinotFS;
 import org.apache.pinot.spi.filesystem.PinotFSFactory;
 import org.apache.pinot.spi.ingestion.batch.runner.IngestionJobRunner;
@@ -40,14 +40,10 @@ import org.apache.pinot.spi.utils.retry.RetriableOperationException;
 import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.spark.api.java.function.VoidFunction;
 
 
 public class SparkSegmentUriPushJobRunner implements IngestionJobRunner, Serializable {
-
-  private static final Logger LOGGER = LoggerFactory.getLogger(SparkSegmentUriPushJobRunner.class);
-
   private SegmentGenerationJobSpec _spec;
 
   public SparkSegmentUriPushJobRunner() {
@@ -70,8 +66,7 @@ public class SparkSegmentUriPushJobRunner implements IngestionJobRunner, Seriali
     //init all file systems
     List<PinotFSSpec> pinotFSSpecs = _spec.getPinotFSSpecs();
     for (PinotFSSpec pinotFSSpec : pinotFSSpecs) {
-      Configuration config = new MapConfiguration(pinotFSSpec.getConfigs());
-      PinotFSFactory.register(pinotFSSpec.getScheme(), pinotFSSpec.getClassName(), config);
+      PinotFSFactory.register(pinotFSSpec.getScheme(), pinotFSSpec.getClassName(), new PinotConfiguration(pinotFSSpec));
     }
 
     //Get outputFS for writing output Pinot segments
@@ -97,8 +92,10 @@ public class SparkSegmentUriPushJobRunner implements IngestionJobRunner, Seriali
     for (String file : files) {
       URI uri = URI.create(file);
       if (uri.getPath().endsWith(Constants.TAR_GZ_FILE_EXT)) {
-        segmentUris.add(_spec.getPushJobSpec().getSegmentUriPrefix() + uri.getRawPath() + _spec.getPushJobSpec()
-            .getSegmentUriSuffix());
+        URI updatedURI = SegmentPushUtils
+            .generateSegmentTarURI(outputDirURI, uri, _spec.getPushJobSpec().getSegmentUriPrefix(),
+                _spec.getPushJobSpec().getSegmentUriSuffix());
+        segmentUris.add(updatedURI.toString());
       }
     }
 
@@ -116,11 +113,16 @@ public class SparkSegmentUriPushJobRunner implements IngestionJobRunner, Seriali
     } else {
       JavaSparkContext sparkContext = JavaSparkContext.fromSparkContext(SparkContext.getOrCreate());
       JavaRDD<String> pathRDD = sparkContext.parallelize(segmentUris, pushParallelism);
-      pathRDD.foreach(segmentUri -> {
-        try {
-          SegmentPushUtils.sendSegmentUris(_spec, Arrays.asList(segmentUri));
-        } catch (RetriableOperationException | AttemptsExceededException e) {
-          throw new RuntimeException(e);
+      // Prevent using lambda expression in Spark to avoid potential serialization exceptions, use inner function instead.
+      pathRDD.foreach(new VoidFunction<String>() {
+        @Override
+        public void call(String segmentUri)
+            throws Exception {
+          try {
+            SegmentPushUtils.sendSegmentUris(_spec, Arrays.asList(segmentUri));
+          } catch (RetriableOperationException | AttemptsExceededException e) {
+            throw new RuntimeException(e);
+          }
         }
       });
     }

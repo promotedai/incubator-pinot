@@ -38,10 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 import org.apache.calcite.sql.SqlKind;
-import org.apache.commons.configuration.Configuration;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.helix.ZNRecord;
-import org.apache.helix.store.zk.ZkHelixPropertyStore;
 import org.apache.pinot.broker.api.RequestStatistics;
 import org.apache.pinot.broker.api.RequesterIdentity;
 import org.apache.pinot.broker.broker.AccessControlFactory;
@@ -78,9 +75,13 @@ import org.apache.pinot.common.utils.helix.TableCache;
 import org.apache.pinot.common.utils.request.RequestUtils;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunctionUtils;
 import org.apache.pinot.core.query.reduce.BrokerReduceService;
+import org.apache.pinot.core.requesthandler.BrokerRequestOptimizer;
+import org.apache.pinot.core.requesthandler.PinotQueryParserFactory;
+import org.apache.pinot.core.requesthandler.PinotQueryRequest;
 import org.apache.pinot.core.transport.ServerInstance;
 import org.apache.pinot.core.util.QueryOptions;
 import org.apache.pinot.spi.config.table.TableType;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.utils.BytesUtils;
 import org.apache.pinot.spi.utils.builder.TableNameBuilder;
 import org.apache.pinot.sql.parsers.CalciteSqlParser;
@@ -92,10 +93,11 @@ import org.slf4j.LoggerFactory;
 public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
   private static final Logger LOGGER = LoggerFactory.getLogger(BaseBrokerRequestHandler.class);
 
-  protected final Configuration _config;
+  protected final PinotConfiguration _config;
   protected final RoutingManager _routingManager;
   protected final AccessControlFactory _accessControlFactory;
   protected final QueryQuotaManager _queryQuotaManager;
+  protected final TableCache _tableCache;
   protected final BrokerMetrics _brokerMetrics;
 
   protected final AtomicLong _requestIdGenerator = new AtomicLong();
@@ -112,37 +114,33 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
   private final RateLimiter _numDroppedLogRateLimiter;
   private final AtomicInteger _numDroppedLog;
 
-  private final boolean _enableCaseInsensitive;
-  private final boolean _enableQueryLimitOverride;
   private final int _defaultHllLog2m;
-  private final TableCache _tableCache;
+  private final boolean _enableQueryLimitOverride;
+  private final boolean _enableDistinctCountBitmapOverride;
 
-  public BaseBrokerRequestHandler(Configuration config, RoutingManager routingManager,
-      AccessControlFactory accessControlFactory, QueryQuotaManager queryQuotaManager, BrokerMetrics brokerMetrics,
-      ZkHelixPropertyStore<ZNRecord> propertyStore) {
+  public BaseBrokerRequestHandler(PinotConfiguration config, RoutingManager routingManager,
+      AccessControlFactory accessControlFactory, QueryQuotaManager queryQuotaManager, TableCache tableCache,
+      BrokerMetrics brokerMetrics) {
     _config = config;
     _routingManager = routingManager;
     _accessControlFactory = accessControlFactory;
     _queryQuotaManager = queryQuotaManager;
+    _tableCache = tableCache;
     _brokerMetrics = brokerMetrics;
 
-    _enableCaseInsensitive = _config.getBoolean(CommonConstants.Helix.ENABLE_CASE_INSENSITIVE_KEY, false);
-    if (_enableCaseInsensitive) {
-      _tableCache = new TableCache(propertyStore);
-    } else {
-      _tableCache = null;
-    }
-    _defaultHllLog2m = _config
-        .getInt(CommonConstants.Helix.DEFAULT_HYPERLOGLOG_LOG2M_KEY, CommonConstants.Helix.DEFAULT_HYPERLOGLOG_LOG2M);
+    _defaultHllLog2m = _config.getProperty(CommonConstants.Helix.DEFAULT_HYPERLOGLOG_LOG2M_KEY,
+        CommonConstants.Helix.DEFAULT_HYPERLOGLOG_LOG2M);
+    _enableQueryLimitOverride = _config.getProperty(Broker.CONFIG_OF_ENABLE_QUERY_LIMIT_OVERRIDE, false);
+    _enableDistinctCountBitmapOverride =
+        _config.getProperty(CommonConstants.Helix.ENABLE_DISTINCT_COUNT_BITMAP_OVERRIDE_KEY, false);
 
-    _enableQueryLimitOverride = _config.getBoolean(Broker.CONFIG_OF_ENABLE_QUERY_LIMIT_OVERRIDE, false);
-
-    _brokerId = config.getString(Broker.CONFIG_OF_BROKER_ID, getDefaultBrokerId());
-    _brokerTimeoutMs = config.getLong(Broker.CONFIG_OF_BROKER_TIMEOUT_MS, Broker.DEFAULT_BROKER_TIMEOUT_MS);
+    _brokerId = config.getProperty(Broker.CONFIG_OF_BROKER_ID, getDefaultBrokerId());
+    _brokerTimeoutMs = config.getProperty(Broker.CONFIG_OF_BROKER_TIMEOUT_MS, Broker.DEFAULT_BROKER_TIMEOUT_MS);
     _queryResponseLimit =
-        config.getInt(Broker.CONFIG_OF_BROKER_QUERY_RESPONSE_LIMIT, Broker.DEFAULT_BROKER_QUERY_RESPONSE_LIMIT);
-    _queryLogLength = config.getInt(Broker.CONFIG_OF_BROKER_QUERY_LOG_LENGTH, Broker.DEFAULT_BROKER_QUERY_LOG_LENGTH);
-    _queryLogRateLimiter = RateLimiter.create(config.getDouble(Broker.CONFIG_OF_BROKER_QUERY_LOG_MAX_RATE_PER_SECOND,
+        config.getProperty(Broker.CONFIG_OF_BROKER_QUERY_RESPONSE_LIMIT, Broker.DEFAULT_BROKER_QUERY_RESPONSE_LIMIT);
+    _queryLogLength =
+        config.getProperty(Broker.CONFIG_OF_BROKER_QUERY_LOG_LENGTH, Broker.DEFAULT_BROKER_QUERY_LOG_LENGTH);
+    _queryLogRateLimiter = RateLimiter.create(config.getProperty(Broker.CONFIG_OF_BROKER_QUERY_LOG_MAX_RATE_PER_SECOND,
         Broker.DEFAULT_BROKER_QUERY_LOG_MAX_RATE_PER_SECOND));
     _numDroppedLog = new AtomicInteger(0);
     _numDroppedLogRateLimiter = RateLimiter.create(1.0);
@@ -198,18 +196,20 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
                 e.getMessage());
       }
     }
-    if (_enableCaseInsensitive) {
-      try {
-        handleCaseSensitivity(brokerRequest);
-      } catch (Exception e) {
-        LOGGER.warn("Caught exception while rewriting PQL to make it case-insensitive {}: {}, {}", requestId, query, e);
-      }
+    updateTableName(brokerRequest);
+    try {
+      updateColumnNames(brokerRequest);
+    } catch (Exception e) {
+      LOGGER.warn("Caught exception while updating Column names in Query {}: {}, {}", requestId, query, e);
     }
     if (_defaultHllLog2m > 0) {
       handleHyperloglogLog2mOverride(brokerRequest, _defaultHllLog2m);
     }
     if (_enableQueryLimitOverride) {
       handleQueryLimitOverride(brokerRequest, _queryResponseLimit);
+    }
+    if (_enableDistinctCountBitmapOverride) {
+      handleDistinctCountBitmapOverride(brokerRequest);
     }
     String tableName = brokerRequest.getQuerySource().getTableName();
     String rawTableName = TableNameBuilder.extractRawTableName(tableName);
@@ -436,6 +436,68 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
   }
 
   /**
+   * Check if table is in the format of [database_name].[table_name].
+   *
+   * Only update TableName in QuerySource if there is no existing table in the format of [database_name].[table_name],
+   * but only [table_name].
+   */
+  private void updateTableName(BrokerRequest brokerRequest) {
+    String tableName = brokerRequest.getQuerySource().getTableName();
+
+    // Use TableCache to handle case-insensitive table name
+    if (_tableCache.isCaseInsensitive()) {
+      String actualTableName = _tableCache.getActualTableName(tableName);
+      if (actualTableName != null) {
+        setTableName(brokerRequest, actualTableName);
+        return;
+      }
+
+      // Check if table is in the format of [database_name].[table_name]
+      String[] tableNameSplits = StringUtils.split(tableName, ".", 2);
+      if (tableNameSplits.length == 2) {
+        actualTableName = _tableCache.getActualTableName(tableNameSplits[1]);
+        if (actualTableName != null) {
+          setTableName(brokerRequest, actualTableName);
+          return;
+        }
+      }
+
+      return;
+    }
+
+    // Check if table is in the format of [database_name].[table_name]
+    String[] tableNameSplits = StringUtils.split(tableName, ".", 2);
+    if (tableNameSplits.length != 2) {
+      return;
+    }
+
+    // Use RoutingManager to handle case-sensitive table name
+    // Update table name if there is no existing table in the format of [database_name].[table_name] but only [table_name]
+    if (TableNameBuilder.isTableResource(tableName)) {
+      if (_routingManager.routingExists(tableNameSplits[1]) && !_routingManager.routingExists(tableName)) {
+        setTableName(brokerRequest, tableNameSplits[1]);
+      }
+      return;
+    }
+    if (_routingManager.routingExists(TableNameBuilder.OFFLINE.tableNameWithType(tableNameSplits[1]))
+        && !_routingManager.routingExists(TableNameBuilder.OFFLINE.tableNameWithType(tableName))) {
+      setTableName(brokerRequest, tableNameSplits[1]);
+      return;
+    }
+    if (_routingManager.routingExists(TableNameBuilder.REALTIME.tableNameWithType(tableNameSplits[1]))
+        && !_routingManager.routingExists(TableNameBuilder.REALTIME.tableNameWithType(tableName))) {
+      setTableName(brokerRequest, tableNameSplits[1]);
+    }
+  }
+
+  private void setTableName(BrokerRequest brokerRequest, String tableName) {
+    brokerRequest.getQuerySource().setTableName(tableName);
+    if (brokerRequest.getPinotQuery() != null) {
+      brokerRequest.getPinotQuery().getDataSource().setTableName(tableName);
+    }
+  }
+
+  /**
    * Set Log2m value for DistinctCountHLL Function
    * @param brokerRequest
    * @param hllLog2mOverride
@@ -508,6 +570,55 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
         if (brokerRequest.getPinotQuery().getLimit() > queryLimit) {
           brokerRequest.getPinotQuery().setLimit(queryLimit);
         }
+      }
+    }
+  }
+
+  /**
+   * Helper method to rewrite 'DistinctCount' with 'DistinctCountBitmap' for the given broker request.
+   */
+  private static void handleDistinctCountBitmapOverride(BrokerRequest brokerRequest) {
+    List<AggregationInfo> aggregationsInfo = brokerRequest.getAggregationsInfo();
+    if (aggregationsInfo != null) {
+      for (AggregationInfo aggregationInfo : aggregationsInfo) {
+        if (StringUtils.remove(aggregationInfo.getAggregationType(), '_')
+            .equalsIgnoreCase(AggregationFunctionType.DISTINCTCOUNT.name())) {
+          aggregationInfo.setAggregationType(AggregationFunctionType.DISTINCTCOUNTBITMAP.name());
+        }
+      }
+    }
+    PinotQuery pinotQuery = brokerRequest.getPinotQuery();
+    if (pinotQuery != null) {
+      for (Expression expression : pinotQuery.getSelectList()) {
+        handleDistinctCountBitmapOverride(expression);
+      }
+      List<Expression> orderByExpressions = pinotQuery.getOrderByList();
+      if (orderByExpressions != null) {
+        for (Expression expression : orderByExpressions) {
+          handleDistinctCountBitmapOverride(expression);
+        }
+      }
+      Expression havingExpression = pinotQuery.getHavingExpression();
+      if (havingExpression != null) {
+        handleDistinctCountBitmapOverride(havingExpression);
+      }
+    }
+  }
+
+  /**
+   * Helper method to rewrite 'DistinctCount' with 'DistinctCountBitmap' for the given expression.
+   */
+  private static void handleDistinctCountBitmapOverride(Expression expression) {
+    Function function = expression.getFunctionCall();
+    if (function == null) {
+      return;
+    }
+    if (StringUtils.remove(function.getOperator(), '_')
+        .equalsIgnoreCase(AggregationFunctionType.DISTINCTCOUNT.name())) {
+      function.setOperator(AggregationFunctionType.DISTINCTCOUNTBITMAP.name());
+    } else {
+      for (Expression operand : function.getOperands()) {
+        handleDistinctCountBitmapOverride(operand);
       }
     }
   }
@@ -622,19 +733,18 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
   }
 
   /**
-   * Fixes the case-insensitive column names to the actual column names in the given broker request.
+   * Fixes the column names to the actual column names in the given broker request.
    */
-  private void handleCaseSensitivity(BrokerRequest brokerRequest) {
-    String inputTableName = brokerRequest.getQuerySource().getTableName();
-    String actualTableName = _tableCache.getActualTableName(inputTableName);
-    brokerRequest.getQuerySource().setTableName(actualTableName);
-    //fix columns
+  private void updateColumnNames(BrokerRequest brokerRequest) {
+    String rawTableName = TableNameBuilder.extractRawTableName(brokerRequest.getQuerySource().getTableName());
+    Map<String, String> columnNameMap =
+        _tableCache.isCaseInsensitive() ? _tableCache.getColumnNameMap(rawTableName) : null;
+
     if (brokerRequest.getFilterSubQueryMap() != null) {
       Collection<FilterQuery> values = brokerRequest.getFilterSubQueryMap().getFilterQueryMap().values();
       for (FilterQuery filterQuery : values) {
         if (filterQuery.getNestedFilterQueryIdsSize() == 0) {
-          String expression = filterQuery.getColumn();
-          filterQuery.setColumn(fixColumnNameCase(actualTableName, expression));
+          filterQuery.setColumn(fixColumnName(rawTableName, filterQuery.getColumn(), columnNameMap));
         }
       }
     }
@@ -643,14 +753,14 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
         if (!info.getAggregationType().equalsIgnoreCase(AggregationFunctionType.COUNT.getName())) {
           // Always read from backward compatible api in AggregationFunctionUtils.
           List<String> arguments = AggregationFunctionUtils.getArguments(info);
-          arguments.replaceAll(e -> fixColumnNameCase(actualTableName, e));
+          arguments.replaceAll(e -> fixColumnName(rawTableName, e, columnNameMap));
           info.setExpressions(arguments);
         }
       }
       if (brokerRequest.isSetGroupBy()) {
         List<String> expressions = brokerRequest.getGroupBy().getExpressions();
         for (int i = 0; i < expressions.size(); i++) {
-          expressions.set(i, fixColumnNameCase(actualTableName, expressions.get(i)));
+          expressions.set(i, fixColumnName(rawTableName, expressions.get(i), columnNameMap));
         }
       }
     } else {
@@ -659,7 +769,7 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
       for (int i = 0; i < selectionColumns.size(); i++) {
         String expression = selectionColumns.get(i);
         if (!expression.equals("*")) {
-          selectionColumns.set(i, fixColumnNameCase(actualTableName, expression));
+          selectionColumns.set(i, fixColumnName(rawTableName, expression, columnNameMap));
         }
       }
     }
@@ -667,65 +777,86 @@ public abstract class BaseBrokerRequestHandler implements BrokerRequestHandler {
       List<SelectionSort> orderBy = brokerRequest.getOrderBy();
       for (SelectionSort selectionSort : orderBy) {
         String expression = selectionSort.getColumn();
-        selectionSort.setColumn(fixColumnNameCase(actualTableName, expression));
+        selectionSort.setColumn(fixColumnName(rawTableName, expression, columnNameMap));
       }
     }
 
     PinotQuery pinotQuery = brokerRequest.getPinotQuery();
     if (pinotQuery != null) {
-      pinotQuery.getDataSource().setTableName(actualTableName);
       for (Expression expression : pinotQuery.getSelectList()) {
-        fixColumnNameCase(actualTableName, expression);
+        fixColumnName(rawTableName, expression, columnNameMap);
       }
       Expression filterExpression = pinotQuery.getFilterExpression();
       if (filterExpression != null) {
-        fixColumnNameCase(actualTableName, filterExpression);
+        fixColumnName(rawTableName, filterExpression, columnNameMap);
       }
       List<Expression> groupByList = pinotQuery.getGroupByList();
       if (groupByList != null) {
         for (Expression expression : groupByList) {
-          fixColumnNameCase(actualTableName, expression);
+          fixColumnName(rawTableName, expression, columnNameMap);
         }
       }
       List<Expression> orderByList = pinotQuery.getOrderByList();
       if (orderByList != null) {
         for (Expression expression : orderByList) {
-          fixColumnNameCase(actualTableName, expression);
+          fixColumnName(rawTableName, expression, columnNameMap);
         }
       }
       Expression havingExpression = pinotQuery.getHavingExpression();
       if (havingExpression != null) {
-        fixColumnNameCase(actualTableName, havingExpression);
+        fixColumnName(rawTableName, havingExpression, columnNameMap);
       }
     }
   }
 
-  private String fixColumnNameCase(String tableNameWithType, String expression) {
+  private String fixColumnName(String rawTableName, String expression, @Nullable Map<String, String> columnNameMap) {
     TransformExpressionTree expressionTree = TransformExpressionTree.compileToExpressionTree(expression);
-    fixColumnNameCase(tableNameWithType, expressionTree);
+    fixColumnName(rawTableName, expressionTree, columnNameMap);
     return expressionTree.toString();
   }
 
-  private void fixColumnNameCase(String tableNameWithType, TransformExpressionTree expression) {
+  private void fixColumnName(String rawTableName, TransformExpressionTree expression,
+      @Nullable Map<String, String> columnNameMap) {
     TransformExpressionTree.ExpressionType expressionType = expression.getExpressionType();
     if (expressionType == TransformExpressionTree.ExpressionType.IDENTIFIER) {
-      expression.setValue(_tableCache.getActualColumnName(tableNameWithType, expression.getValue()));
+      expression.setValue(getActualColumnName(rawTableName, expression.getValue(), columnNameMap));
     } else if (expressionType == TransformExpressionTree.ExpressionType.FUNCTION) {
       for (TransformExpressionTree child : expression.getChildren()) {
-        fixColumnNameCase(tableNameWithType, child);
+        fixColumnName(rawTableName, child, columnNameMap);
       }
     }
   }
 
-  private void fixColumnNameCase(String tableNameWithType, Expression expression) {
+  private void fixColumnName(String rawTableName, Expression expression, @Nullable Map<String, String> columnNameMap) {
     ExpressionType expressionType = expression.getType();
     if (expressionType == ExpressionType.IDENTIFIER) {
       Identifier identifier = expression.getIdentifier();
-      identifier.setName(_tableCache.getActualColumnName(tableNameWithType, identifier.getName()));
+      identifier.setName(getActualColumnName(rawTableName, identifier.getName(), columnNameMap));
     } else if (expressionType == ExpressionType.FUNCTION) {
       for (Expression operand : expression.getFunctionCall().getOperands()) {
-        fixColumnNameCase(tableNameWithType, operand);
+        fixColumnName(rawTableName, operand, columnNameMap);
       }
+    }
+  }
+
+  private String getActualColumnName(String rawTableName, String columnName,
+      @Nullable Map<String, String> columnNameMap) {
+    // Check if column is in the format of [table_name].[column_name]
+    String[] splits = StringUtils.split(columnName, ".", 2);
+    if (_tableCache.isCaseInsensitive()) {
+      if (splits.length == 2 && rawTableName.equalsIgnoreCase(splits[0])) {
+        columnName = splits[1];
+      }
+      if (columnNameMap != null) {
+        return columnNameMap.getOrDefault(columnName, columnName);
+      } else {
+        return columnName;
+      }
+    } else {
+      if (splits.length == 2 && rawTableName.equals(splits[0])) {
+        columnName = splits[1];
+      }
+      return columnName;
     }
   }
 

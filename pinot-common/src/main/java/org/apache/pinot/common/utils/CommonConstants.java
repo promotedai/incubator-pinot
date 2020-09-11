@@ -24,10 +24,20 @@ import java.io.File;
 public class CommonConstants {
 
   public static final String PREFIX_OF_SSL_SUBSET = "ssl";
+  public static final String HTTP_PROTOCOL = "http";
+  public static final String HTTPS_PROTOCOL = "https";
+
+  public static class Table {
+    public static final String PUSH_FREQUENCY_HOURLY = "hourly";
+    public static final String PUSH_FREQUENCY_DAILY = "daily";
+    public static final String PUSH_FREQUENCY_WEEKLY = "weekly";
+    public static final String PUSH_FREQUENCY_MONTHLY = "monthly";
+  }
 
   public static class Helix {
     public static final String IS_SHUTDOWN_IN_PROGRESS = "shutdownInProgress";
     public static final String QUERIES_DISABLED = "queriesDisabled";
+    public static final String QUERY_RATE_LIMIT_DISABLED = "queryRateLimitDisabled";
 
     public static final String INSTANCE_CONNECTED_METRIC_NAME = "helix.connected";
 
@@ -46,6 +56,9 @@ public class CommonConstants {
 
     public static final String DEFAULT_HYPERLOGLOG_LOG2M_KEY = "default.hyperloglog.log2m";
     public static final int DEFAULT_HYPERLOGLOG_LOG2M = 8;
+
+    // Whether to rewrite DistinctCount to DistinctCountBitmap
+    public static final String ENABLE_DISTINCT_COUNT_BITMAP_OVERRIDE_KEY = "enable.distinct.count.bitmap.override";
 
     // More information on why these numbers are set can be found in the following doc:
     // https://cwiki.apache.org/confluence/display/PINOT/Controller+Separation+between+Helix+and+Pinot
@@ -92,6 +105,7 @@ public class CommonConstants {
       public static final String INSTANCE_ID_KEY = "instanceId";
       public static final String DATA_DIR_KEY = "dataDir";
       public static final String ADMIN_PORT_KEY = "adminPort";
+      public static final String GRPC_PORT_KEY = "grpcPort";
     }
 
     public static final String SET_INSTANCE_ID_TO_HOSTNAME_KEY = "pinot.set.instance.id.to.hostname";
@@ -109,6 +123,9 @@ public class CommonConstants {
     public static final String CONFIG_OF_BROKER_FLAPPING_TIME_WINDOW_MS = "pinot.broker.flapping.timeWindowMs";
     public static final String CONFIG_OF_SERVER_FLAPPING_TIME_WINDOW_MS = "pinot.server.flapping.timeWindowMs";
     public static final String CONFIG_OF_MINION_FLAPPING_TIME_WINDOW_MS = "pinot.minion.flapping.timeWindowMs";
+    public static final String CONFIG_OF_HELIX_INSTANCE_MAX_STATE_TRANSITIONS =
+        "pinot.helix.instance.state.maxStateTransitions";
+    public static final String DEFAULT_HELIX_INSTANCE_MAX_STATE_TRANSITIONS = "100000";
     public static final String DEFAULT_FLAPPING_TIME_WINDOW_MS = "1";
 
     public static final String PINOT_SERVICE_ROLE = "pinot.service.role";
@@ -174,7 +191,12 @@ public class CommonConstants {
     public static final String CONFIG_OF_QUERY_EXECUTOR_CLASS = "pinot.server.query.executor.class";
     public static final String CONFIG_OF_REQUEST_HANDLER_FACTORY_CLASS = "pinot.server.requestHandlerFactory.class";
     public static final String CONFIG_OF_NETTY_PORT = "pinot.server.netty.port";
+    public static final String CONFIG_OF_ENABLE_GRPC_SERVER = "pinot.server.grpc.enable";
+    public static final boolean DEFAULT_ENABLE_GRPC_SERVER = false;
+    public static final String CONFIG_OF_GRPC_PORT = "pinot.server.grpc.port";
+    public static final int DEFAULT_GRPC_PORT = 8090;
     public static final String CONFIG_OF_ADMIN_API_PORT = "pinot.server.adminapi.port";
+    public static final int DEFAULT_ADMIN_API_PORT = 8097;
 
     public static final String CONFIG_OF_SEGMENT_FORMAT_VERSION = "pinot.server.instance.segment.format.version";
     public static final String CONFIG_OF_ENABLE_SPLIT_COMMIT = "pinot.server.instance.enable.split.commit";
@@ -195,7 +217,6 @@ public class CommonConstants {
         "pinot.server.starter.realtimeConsumptionCatchupWaitMs";
     public static final int DEFAULT_STARTUP_REALTIME_CONSUMPTION_CATCHUP_WAIT_MS = 0;
 
-    public static final int DEFAULT_ADMIN_API_PORT = 8097;
     public static final String DEFAULT_READ_MODE = "mmap";
     // Whether to reload consuming segment on scheme update. Will change default behavior to true when this feature is stabilized
     public static final boolean DEFAULT_RELOAD_CONSUMING_SEGMENT = false;
@@ -242,7 +263,7 @@ public class CommonConstants {
         "pinot.server.shutdown.resourceCheckIntervalMs";
     public static final long DEFAULT_SHUTDOWN_RESOURCE_CHECK_INTERVAL_MS = 10_000L;
 
-    public static final String DEFAULT_COLUMN_MIN_MAX_VALUE_GENERATOR_MODE = "TIME";
+    public static final String DEFAULT_COLUMN_MIN_MAX_VALUE_GENERATOR_MODE = "ALL";
 
     public static final String PINOT_SERVER_METRICS_PREFIX = "pinot.server.metrics.prefix";
 
@@ -271,6 +292,7 @@ public class CommonConstants {
     public static final String VERSION_HTTP_HEADER = "Pinot-Controller-Version";
     public static final String SEGMENT_NAME_HTTP_HEADER = "Pinot-Segment-Name";
     public static final String TABLE_NAME_HTTP_HEADER = "Pinot-Table-Name";
+    public static final String INGESTION_DESCRIPTOR = "Pinot-Ingestion-Descriptor";
     public static final String PREFIX_OF_CONFIG_OF_PINOT_CRYPTER = "pinot.controller.crypter";
 
     public static final String CONFIG_OF_CONTROLLER_METRICS_PREFIX = "controller.metrics.prefix";
@@ -337,6 +359,7 @@ public class CommonConstants {
     public static final String FLUSH_THRESHOLD_SIZE = "segment.flush.threshold.size";
     public static final String FLUSH_THRESHOLD_TIME = "segment.flush.threshold.time";
     public static final String PARTITION_METADATA = "segment.partition.metadata";
+    public static final String PEER_SEGMENT_DOWNLOAD_SCHEME = "peer://";
     /**
      * This field is used for parallel push protection to lock the segment globally.
      * We put the segment upload start timestamp so that if the previous push failed without unlock the segment, the
@@ -350,6 +373,7 @@ public class CommonConstants {
     public static final String SEGMENT_TEMP_DIR_SUFFIX = ".segment.tmp";
 
     public static final String LOCAL_SEGMENT_SCHEME = "file";
+    public static final String METADATA_URI_FOR_PEER_DOWNLOAD = "";
 
     public enum SegmentType {
       OFFLINE, REALTIME
@@ -368,5 +392,37 @@ public class CommonConstants {
 
     @Deprecated
     public static final String TABLE_NAME = "segment.table.name";
+  }
+
+  public static class Query {
+    public static class Request {
+      public static class MetadataKeys {
+        public static final String REQUEST_ID = "requestId";
+        public static final String BROKER_ID = "brokerId";
+        public static final String ENABLE_TRACE = "enableTrace";
+        public static final String ENABLE_STREAMING = "enableStreaming";
+        public static final String PAYLOAD_TYPE = "payloadType";
+      }
+
+      public static class PayloadType {
+        public static final String SQL = "sql";
+        public static final String BROKER_REQUEST = "brokerRequest";
+      }
+    }
+
+    public static class Response {
+      public static class MetadataKeys {
+        public static final String RESPONSE_TYPE = "responseType";
+      }
+
+      public static class ResponseType {
+        // For streaming response, multiple (could be 0 if no data should be returned, or query encounters exception)
+        // data responses will be returned, followed by one single metadata response
+        public static final String DATA = "data";
+        public static final String METADATA = "metadata";
+        // For non-streaming response
+        public static final String NON_STREAMING = "nonStreaming";
+      }
+    }
   }
 }

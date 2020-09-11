@@ -23,19 +23,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.annotation.Nullable;
+
+import com.google.common.base.Preconditions;
 import org.apache.pinot.core.common.DataSource;
-import org.apache.pinot.core.indexsegment.IndexSegmentUtils;
-import org.apache.pinot.core.io.reader.DataFileReader;
 import org.apache.pinot.core.segment.index.column.ColumnIndexContainer;
 import org.apache.pinot.core.segment.index.datasource.ImmutableDataSource;
+import org.apache.pinot.core.segment.index.metadata.ColumnMetadata;
 import org.apache.pinot.core.segment.index.metadata.SegmentMetadataImpl;
 import org.apache.pinot.core.segment.index.readers.Dictionary;
+import org.apache.pinot.core.segment.index.readers.ForwardIndexReader;
 import org.apache.pinot.core.segment.index.readers.InvertedIndexReader;
 import org.apache.pinot.core.segment.store.SegmentDirectory;
 import org.apache.pinot.core.startree.v2.StarTreeV2;
 import org.apache.pinot.core.startree.v2.store.StarTreeIndexContainer;
-import org.apache.pinot.spi.data.FieldSpec;
-import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.data.readers.GenericRow;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,7 +68,7 @@ public class ImmutableSegmentImpl implements ImmutableSegment {
   }
 
   @Override
-  public DataFileReader getForwardIndex(String column) {
+  public ForwardIndexReader getForwardIndex(String column) {
     return _indexContainerMap.get(column).getForwardIndex();
   }
 
@@ -94,7 +94,10 @@ public class ImmutableSegmentImpl implements ImmutableSegment {
 
   @Override
   public DataSource getDataSource(String column) {
-    return new ImmutableDataSource(_segmentMetadata.getColumnMetadataFor(column), _indexContainerMap.get(column));
+    ColumnMetadata columnMetadata = _segmentMetadata.getColumnMetadataFor(column);
+    Preconditions.checkNotNull(columnMetadata,
+        "ColumnMetadata for " + column + " should not be null. " + "Potentially invalid column name specified.");
+    return new ImmutableDataSource(columnMetadata, _indexContainerMap.get(column));
   }
 
   @Override
@@ -138,16 +141,7 @@ public class ImmutableSegmentImpl implements ImmutableSegment {
 
   @Override
   public GenericRow getRecord(int docId, GenericRow reuse) {
-    Schema schema = _segmentMetadata.getSchema();
-    for (FieldSpec fieldSpec : schema.getAllFieldSpecs()) {
-      if (!fieldSpec.isVirtualColumn()) {
-        String columnName = fieldSpec.getName();
-        ColumnIndexContainer indexContainer = _indexContainerMap.get(columnName);
-        reuse.putField(columnName, IndexSegmentUtils
-            .getValue(docId, fieldSpec, indexContainer.getForwardIndex(), indexContainer.getDictionary(),
-                _segmentMetadata.getColumnMetadataFor(columnName).getMaxNumberOfMultiValues()));
-      }
-    }
-    return reuse;
+    // NOTE: Use PinotSegmentRecordReader to read immutable segment
+    throw new UnsupportedOperationException();
   }
 }

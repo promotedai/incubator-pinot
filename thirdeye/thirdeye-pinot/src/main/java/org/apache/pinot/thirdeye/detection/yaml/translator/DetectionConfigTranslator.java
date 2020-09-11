@@ -20,6 +20,9 @@
 package org.apache.pinot.thirdeye.detection.yaml.translator;
 
 import com.google.common.base.Preconditions;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -55,7 +58,7 @@ import org.apache.pinot.thirdeye.detection.yaml.translator.builder.DetectionProp
  * +-----v----+     +-----v----+
  * | Rule     |     | Algorithm|
  * | detection|     | Detection|
- * +-------------+  +-----+----+
+ * +----------+     +-----+----+
  *       |                |
  * +-----v----+     +-----v----+
  * |Rule      |     |Algorithm |
@@ -112,6 +115,7 @@ public class DetectionConfigTranslator extends ConfigTranslator<DetectionConfigD
   static final String PROP_CRON = "cron";
   static final String PROP_TYPE = "type";
   static final String PROP_NAME = "name";
+  static final String PROP_LAST_TIMESTAMP = "lastTimestamp";
 
   private static final String PROP_DETECTION_NAME = "detectionName";
   private static final String PROP_DESC_NAME = "description";
@@ -139,7 +143,9 @@ public class DetectionConfigTranslator extends ConfigTranslator<DetectionConfigD
   }
 
   @Override
-  DetectionConfigDTO translateConfig(Map<String, Object> yamlConfigMap) throws IllegalArgumentException {
+  DetectionConfigDTO translateConfig() {
+    Map<String, Object> yamlConfigMap = ConfigUtils.getMap(this.yaml.load(yamlConfig));
+
     // Hack to support 'detectionName' attribute at root level and 'name' attribute elsewhere
     // We consistently use 'name' as a convention to define the sub-alerts. However, at the root
     // level, as a convention, we will use 'detectionName' which defines the name of the complete alert.
@@ -161,8 +167,6 @@ public class DetectionConfigTranslator extends ConfigTranslator<DetectionConfigD
       Preconditions.checkArgument(yamlConfigMap.containsKey(PROP_CRON), "Missing property (" + PROP_CRON + ") in alert");
       cron = MapUtils.getString(yamlConfigMap, PROP_CRON);
     } else {
-      // The legacy type 'COMPOSITE' will be treated as a metric alert along with the new convention METRIC_ALERT.
-      // This is applicable only at the root level to maintain backward compatibility.
       detectionProperties = detectionTranslatorBuilder.buildMetricAlertProperties(yamlConfigMap);
       qualityProperties = dataQualityTranslatorBuilder.buildMetricAlertProperties(yamlConfigMap);
       cron = metricAttributesMap.fetchCron(yamlConfigMap);
@@ -180,12 +184,20 @@ public class DetectionConfigTranslator extends ConfigTranslator<DetectionConfigD
     config.setName(MapUtils.getString(yamlConfigMap, PROP_DETECTION_NAME));
     config.setDescription(MapUtils.getString(yamlConfigMap, PROP_DESC_NAME));
     config.setDescription(MapUtils.getString(yamlConfigMap, PROP_DESC_NAME));
-    config.setLastTimestamp(System.currentTimeMillis());
-    config.setOwners(filterOwners(ConfigUtils.getList(yamlConfigMap.get(PROP_OWNERS))));
+    List<String> owners = ConfigUtils.getList(yamlConfigMap.get(PROP_OWNERS));
+    owners.replaceAll(String::trim);
+    config.setOwners(new ArrayList<>(new HashSet<>(owners)));
+
+    /*
+     * The lastTimestamp value is used as a checkpoint/high watermark for onboarding data.
+     * This implies that data entries post this timestamp will be processed for
+     * anomalies.
+     */
+    config.setLastTimestamp(longValue(yamlConfigMap.get(PROP_LAST_TIMESTAMP)));
 
     config.setProperties(detectionProperties);
     config.setDataQualityProperties(qualityProperties);
-    config.setComponentSpecs(this.metricAttributesMap.getAllComponenets());
+    config.setComponentSpecs(this.metricAttributesMap.getAllComponents());
     config.setCron(cron);
     config.setActive(MapUtils.getBooleanValue(yamlConfigMap, PROP_ACTIVE, true));
     config.setYaml(yamlConfig);
@@ -194,9 +206,16 @@ public class DetectionConfigTranslator extends ConfigTranslator<DetectionConfigD
     List<DatasetConfigDTO> datasetConfigs = this.metricAttributesMap.getAllDatasets();
     if (MapUtils.getString(yamlConfigMap, PROP_CRON) == null
         && datasetConfigs.stream().allMatch(c -> c.bucketTimeGranularity().getUnit().equals(TimeUnit.DAYS))
-        && datasetConfigs.stream().allMatch(c -> c.getDataSource().equals(PinotThirdEyeDataSource.DATA_SOURCE_NAME))) {
+        && datasetConfigs.stream().allMatch(c -> c.getDataSource().equals(PinotThirdEyeDataSource.class.getSimpleName()))) {
       config.setDataAvailabilitySchedule(true);
     }
     return config;
+  }
+
+  private static long longValue(final Object o) {
+    if (o instanceof Number) {
+      return ((Number) o).longValue();
+    }
+    return -1;
   }
 }

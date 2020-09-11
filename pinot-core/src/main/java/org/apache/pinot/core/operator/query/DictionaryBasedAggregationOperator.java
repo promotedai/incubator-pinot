@@ -18,6 +18,11 @@
  */
 package org.apache.pinot.core.operator.query;
 
+import it.unimi.dsi.fastutil.doubles.DoubleOpenHashSet;
+import it.unimi.dsi.fastutil.floats.FloatOpenHashSet;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +33,7 @@ import org.apache.pinot.core.query.aggregation.function.AggregationFunction;
 import org.apache.pinot.core.query.aggregation.function.customobject.MinMaxRangePair;
 import org.apache.pinot.core.query.request.context.ExpressionContext;
 import org.apache.pinot.core.segment.index.readers.Dictionary;
+import org.apache.pinot.spi.utils.ByteArray;
 
 
 /**
@@ -62,16 +68,68 @@ public class DictionaryBasedAggregationOperator extends BaseOperator<Intermediat
     for (AggregationFunction aggregationFunction : _aggregationFunctions) {
       String column = ((ExpressionContext) aggregationFunction.getInputExpressions().get(0)).getIdentifier();
       Dictionary dictionary = _dictionaryMap.get(column);
+      int dictionarySize = dictionary.length();
       switch (aggregationFunction.getType()) {
         case MAX:
-          aggregationResults.add(dictionary.getDoubleValue(dictionary.length() - 1));
+          aggregationResults.add(dictionary.getDoubleValue(dictionarySize - 1));
           break;
         case MIN:
           aggregationResults.add(dictionary.getDoubleValue(0));
           break;
         case MINMAXRANGE:
-          aggregationResults.add(
-              new MinMaxRangePair(dictionary.getDoubleValue(0), dictionary.getDoubleValue(dictionary.length() - 1)));
+          aggregationResults
+              .add(new MinMaxRangePair(dictionary.getDoubleValue(0), dictionary.getDoubleValue(dictionarySize - 1)));
+          break;
+        case DISTINCTCOUNT:
+          switch (dictionary.getValueType()) {
+            case INT:
+              IntOpenHashSet intSet = new IntOpenHashSet(dictionarySize);
+              for (int dictId = 0; dictId < dictionarySize; dictId++) {
+                intSet.add(dictionary.getIntValue(dictId));
+              }
+              aggregationResults.add(intSet);
+              break;
+            case LONG:
+              LongOpenHashSet longSet = new LongOpenHashSet(dictionarySize);
+              for (int dictId = 0; dictId < dictionarySize; dictId++) {
+                longSet.add(dictionary.getLongValue(dictId));
+              }
+              aggregationResults.add(longSet);
+              break;
+            case FLOAT:
+              FloatOpenHashSet floatSet = new FloatOpenHashSet(dictionarySize);
+              for (int dictId = 0; dictId < dictionarySize; dictId++) {
+                floatSet.add(dictionary.getFloatValue(dictId));
+              }
+              aggregationResults.add(floatSet);
+              break;
+            case DOUBLE:
+              DoubleOpenHashSet doubleSet = new DoubleOpenHashSet(dictionarySize);
+              for (int dictId = 0; dictId < dictionarySize; dictId++) {
+                doubleSet.add(dictionary.getDoubleValue(dictId));
+              }
+              aggregationResults.add(doubleSet);
+              break;
+            case STRING:
+              ObjectOpenHashSet<String> stringSet = new ObjectOpenHashSet<>(dictionarySize);
+              for (int dictId = 0; dictId < dictionarySize; dictId++) {
+                stringSet.add(dictionary.getStringValue(dictId));
+              }
+              aggregationResults.add(stringSet);
+              break;
+            case BYTES:
+              ObjectOpenHashSet<ByteArray> bytesSet = new ObjectOpenHashSet<>(dictionarySize);
+              for (int dictId = 0; dictId < dictionarySize; dictId++) {
+                bytesSet.add(new ByteArray(dictionary.getBytesValue(dictId)));
+              }
+              aggregationResults.add(bytesSet);
+              break;
+            default:
+              throw new IllegalStateException();
+          }
+          break;
+        case SEGMENTPARTITIONEDDISTINCTCOUNT:
+          aggregationResults.add((long) dictionarySize);
           break;
         default:
           throw new IllegalStateException(

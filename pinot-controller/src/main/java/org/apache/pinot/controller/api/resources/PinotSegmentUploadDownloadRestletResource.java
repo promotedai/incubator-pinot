@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.controller.api.resources;
 
+import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
@@ -32,6 +33,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.Executor;
 import javax.annotation.Nullable;
 import javax.inject.Inject;
@@ -59,6 +61,7 @@ import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pinot.common.metrics.ControllerMeter;
 import org.apache.pinot.common.metrics.ControllerMetrics;
+import org.apache.pinot.common.restlet.resources.StartReplaceSegmentsRequest;
 import org.apache.pinot.common.utils.CommonConstants;
 import org.apache.pinot.common.utils.FileUploadDownloadClient;
 import org.apache.pinot.common.utils.StringUtil;
@@ -74,10 +77,12 @@ import org.apache.pinot.controller.helix.core.PinotHelixResourceManager;
 import org.apache.pinot.core.metadata.DefaultMetadataExtractor;
 import org.apache.pinot.core.metadata.MetadataExtractorFactory;
 import org.apache.pinot.core.segment.index.metadata.SegmentMetadata;
+import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.crypt.PinotCrypter;
 import org.apache.pinot.spi.crypt.PinotCrypterFactory;
 import org.apache.pinot.spi.filesystem.PinotFS;
 import org.apache.pinot.spi.filesystem.PinotFSFactory;
+import org.apache.pinot.spi.utils.JsonUtils;
 import org.apache.pinot.spi.utils.builder.TableNameBuilder;
 import org.glassfish.grizzly.http.server.Request;
 import org.glassfish.jersey.media.multipart.FormDataBodyPart;
@@ -159,8 +164,8 @@ public class PinotSegmentUploadDownloadRestletResource {
             "Segment: " + segmentName + " of table: " + tableName + " not found at: " + remoteSegmentFileURI,
             Response.Status.NOT_FOUND);
       }
-      segmentFile = new File(ControllerFilePathProvider.getInstance().getFileDownloadTempDir(),
-          StringUtil.join(File.separator, tableName, segmentName + "-" + System.nanoTime()));
+      segmentFile = new File(new File(ControllerFilePathProvider.getInstance().getFileDownloadTempDir(), tableName),
+          segmentName + "-" + UUID.randomUUID());
       pinotFS.copyToLocalFile(remoteSegmentFileURI, segmentFile);
       // Streaming in the tmp file and delete it afterward.
       builder.entity((StreamingOutput) output -> {
@@ -181,9 +186,11 @@ public class PinotSegmentUploadDownloadRestletResource {
     String uploadTypeStr = null;
     String crypterClassNameInHeader = null;
     String downloadUri = null;
+    String ingestionDescriptor = null;
     if (headers != null) {
       extractHttpHeader(headers, CommonConstants.Controller.SEGMENT_NAME_HTTP_HEADER);
       extractHttpHeader(headers, CommonConstants.Controller.TABLE_NAME_HTTP_HEADER);
+      ingestionDescriptor = extractHttpHeader(headers, CommonConstants.Controller.INGESTION_DESCRIPTOR);
       uploadTypeStr = extractHttpHeader(headers, FileUploadDownloadClient.CustomHeaders.UPLOAD_TYPE);
       crypterClassNameInHeader = extractHttpHeader(headers, FileUploadDownloadClient.CustomHeaders.CRYPTER);
       downloadUri = extractHttpHeader(headers, FileUploadDownloadClient.CustomHeaders.DOWNLOAD_URI);
@@ -194,7 +201,7 @@ public class PinotSegmentUploadDownloadRestletResource {
     File tempSegmentDir = null;
     try {
       ControllerFilePathProvider provider = ControllerFilePathProvider.getInstance();
-      String tempFileName = TMP_DIR_PREFIX + System.nanoTime();
+      String tempFileName = TMP_DIR_PREFIX + UUID.randomUUID();
       tempDecryptedFile = new File(provider.getFileUploadTempDir(), tempFileName);
       tempEncryptedFile = new File(provider.getFileUploadTempDir(), tempFileName + ENCRYPTED_SUFFIX);
       tempSegmentDir = new File(provider.getUntarredFileTempDir(), tempFileName);
@@ -237,9 +244,8 @@ public class PinotSegmentUploadDownloadRestletResource {
 
       String offlineTableName = TableNameBuilder.OFFLINE.tableNameWithType(rawTableName);
       String clientAddress = InetAddress.getByName(request.getRemoteAddr()).getHostName();
-      LOGGER
-          .info("Processing upload request for segment: {} of table: {} from client: {}", segmentName, offlineTableName,
-              clientAddress);
+      LOGGER.info("Processing upload request for segment: {} of table: {} from client: {}, ingestion descriptor: {}",
+          segmentName, offlineTableName, clientAddress, ingestionDescriptor);
 
       // Validate segment
       new SegmentValidator(_pinotHelixResourceManager, _controllerConf, _executor, _connectionManager,
@@ -451,6 +457,46 @@ public class PinotSegmentUploadDownloadRestletResource {
       asyncResponse.resume(uploadSegment(tableName, multiPart, enableParallelPushProtection, headers, request, true));
     } catch (Throwable t) {
       asyncResponse.resume(t);
+    }
+  }
+
+  @POST
+  @Path("segments/{tableName}/startReplaceSegments")
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation(value = "Start to replace segments", notes = "Start to replace segments")
+  public Response startReplaceSegments(
+      @ApiParam(value = "Name of the table", required = true) @PathParam("tableName") String tableName,
+      @ApiParam(value = "OFFLINE|REALTIME") @QueryParam("type") String tableTypeStr,
+      StartReplaceSegmentsRequest startReplaceSegmentsRequest) {
+    try {
+      String tableNameWithType =
+          TableNameBuilder.forType(TableType.valueOf(tableTypeStr.toUpperCase())).tableNameWithType(tableName);
+      String segmentLineageEntryId = _pinotHelixResourceManager
+          .startReplaceSegments(tableNameWithType, startReplaceSegmentsRequest.getSegmentsFrom(),
+              startReplaceSegmentsRequest.getSegmentsTo());
+      return Response.ok(JsonUtils.newObjectNode().put("segmentLineageEntryId", segmentLineageEntryId)).build();
+    } catch (Exception e) {
+      throw new ControllerApplicationException(LOGGER, e.getMessage(), Response.Status.INTERNAL_SERVER_ERROR, e);
+    }
+  }
+
+  @POST
+  @Path("segments/{tableName}/endReplaceSegments")
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation(value = "End to replace segments", notes = "End to replace segments")
+  public Response endReplaceSegments(
+      @ApiParam(value = "Name of the table", required = true) @PathParam("tableName") String tableName,
+      @ApiParam(value = "OFFLINE|REALTIME") @QueryParam("type") String tableTypeStr,
+      @ApiParam(value = "Segment lineage entry id returned by startReplaceSegments API") @QueryParam("segmentLineageEntryId") String segmentLineageEntryId) {
+    try {
+      String tableNameWithType =
+          TableNameBuilder.forType(TableType.valueOf(tableTypeStr.toUpperCase())).tableNameWithType(tableName);
+      // Check that the segment lineage entry id is valid
+      Preconditions.checkNotNull(segmentLineageEntryId, "'segmentLineageEntryId' should not be null");
+      _pinotHelixResourceManager.endReplaceSegments(tableNameWithType, segmentLineageEntryId);
+      return Response.ok().build();
+    } catch (Exception e) {
+      throw new ControllerApplicationException(LOGGER, e.getMessage(), Response.Status.INTERNAL_SERVER_ERROR, e);
     }
   }
 

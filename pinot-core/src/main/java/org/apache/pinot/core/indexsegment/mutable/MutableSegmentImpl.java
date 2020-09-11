@@ -21,6 +21,7 @@ package org.apache.pinot.core.indexsegment.mutable;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Sets;
 import it.unimi.dsi.fastutil.ints.IntArrays;
+import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -36,23 +37,20 @@ import javax.annotation.Nullable;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pinot.core.common.DataSource;
 import org.apache.pinot.core.data.partition.PartitionFunction;
-import org.apache.pinot.core.indexsegment.IndexSegmentUtils;
-import org.apache.pinot.core.io.reader.DataFileReader;
-import org.apache.pinot.core.io.readerwriter.BaseSingleColumnSingleValueReaderWriter;
 import org.apache.pinot.core.io.readerwriter.PinotDataBufferMemoryManager;
-import org.apache.pinot.core.io.readerwriter.impl.FixedByteSingleColumnMultiValueReaderWriter;
-import org.apache.pinot.core.io.readerwriter.impl.FixedByteSingleColumnSingleValueReaderWriter;
-import org.apache.pinot.core.io.readerwriter.impl.VarByteSingleColumnSingleValueReaderWriter;
 import org.apache.pinot.core.realtime.impl.RealtimeSegmentConfig;
 import org.apache.pinot.core.realtime.impl.RealtimeSegmentStatsHistory;
 import org.apache.pinot.core.realtime.impl.dictionary.BaseMutableDictionary;
 import org.apache.pinot.core.realtime.impl.dictionary.BaseOffHeapMutableDictionary;
 import org.apache.pinot.core.realtime.impl.dictionary.MutableDictionaryFactory;
+import org.apache.pinot.core.realtime.impl.forward.FixedByteMVMutableForwardIndex;
+import org.apache.pinot.core.realtime.impl.forward.FixedByteSVMutableForwardIndex;
+import org.apache.pinot.core.realtime.impl.forward.VarByteSVMutableForwardIndex;
 import org.apache.pinot.core.realtime.impl.invertedindex.RealtimeInvertedIndexReader;
 import org.apache.pinot.core.realtime.impl.invertedindex.RealtimeLuceneIndexRefreshState;
 import org.apache.pinot.core.realtime.impl.invertedindex.RealtimeLuceneIndexRefreshState.RealtimeLuceneReaders;
 import org.apache.pinot.core.realtime.impl.invertedindex.RealtimeLuceneTextIndexReader;
-import org.apache.pinot.core.realtime.impl.nullvalue.RealtimeNullValueVectorReaderWriter;
+import org.apache.pinot.core.realtime.impl.nullvalue.MutableNullValueVector;
 import org.apache.pinot.core.segment.creator.impl.V1Constants;
 import org.apache.pinot.core.segment.index.datasource.ImmutableDataSource;
 import org.apache.pinot.core.segment.index.datasource.MutableDataSource;
@@ -60,7 +58,7 @@ import org.apache.pinot.core.segment.index.metadata.SegmentMetadata;
 import org.apache.pinot.core.segment.index.metadata.SegmentMetadataImpl;
 import org.apache.pinot.core.segment.index.readers.BloomFilterReader;
 import org.apache.pinot.core.segment.index.readers.InvertedIndexReader;
-import org.apache.pinot.core.segment.index.readers.NullValueVectorReader;
+import org.apache.pinot.core.segment.index.readers.MutableForwardIndex;
 import org.apache.pinot.core.segment.virtualcolumn.VirtualColumnContext;
 import org.apache.pinot.core.segment.virtualcolumn.VirtualColumnProvider;
 import org.apache.pinot.core.segment.virtualcolumn.VirtualColumnProviderFactory;
@@ -72,15 +70,18 @@ import org.apache.pinot.spi.config.table.ColumnPartitionConfig;
 import org.apache.pinot.spi.config.table.SegmentPartitionConfig;
 import org.apache.pinot.spi.data.DimensionFieldSpec;
 import org.apache.pinot.spi.data.FieldSpec;
+import org.apache.pinot.spi.data.FieldSpec.DataType;
 import org.apache.pinot.spi.data.MetricFieldSpec;
 import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.data.readers.GenericRow;
 import org.apache.pinot.spi.stream.RowMetadata;
+import org.apache.pinot.spi.utils.ByteArray;
 import org.roaringbitmap.IntIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
+@SuppressWarnings({"rawtypes", "unchecked"})
 public class MutableSegmentImpl implements MutableSegment {
   // For multi-valued column, forward-index.
   // Maximum number of multi-values per row. We assert on this.
@@ -109,22 +110,12 @@ public class MutableSegmentImpl implements MutableSegment {
   private final int _partitionId;
   private final boolean _nullHandlingEnabled;
 
-  // TODO: Keep one map to store all these info
-  private final Map<String, NumValuesInfo> _numValuesInfoMap = new HashMap<>();
-  private final Map<String, BaseMutableDictionary> _dictionaryMap = new HashMap<>();
-  private final Map<String, DataFileReader> _indexReaderWriterMap = new HashMap<>();
-  private final Map<String, InvertedIndexReader> _invertedIndexMap = new HashMap<>();
-  private final Map<String, InvertedIndexReader> _rangeIndexMap = new HashMap<>();
-  private final Map<String, BloomFilterReader> _bloomFilterMap = new HashMap<>();
-  private final Map<String, RealtimeNullValueVectorReaderWriter> _nullValueVectorMap = new HashMap<>();
+  private final Map<String, IndexContainer> _indexContainerMap = new HashMap<>();
+
   private final IdMap<FixedIntArray> _recordIdMap;
   private boolean _aggregateMetrics;
 
   private volatile int _numDocsIndexed = 0;
-
-  // to compute the rolling interval
-  private volatile long _minTime = Long.MAX_VALUE;
-  private volatile long _maxTime = Long.MIN_VALUE;
   private final int _numKeyColumns;
 
   // Cache the physical (non-virtual) field specs
@@ -182,7 +173,6 @@ public class MutableSegmentImpl implements MutableSegment {
     for (FieldSpec fieldSpec : allFieldSpecs) {
       if (!fieldSpec.isVirtualColumn()) {
         physicalFieldSpecs.add(fieldSpec);
-
         FieldSpec.FieldType fieldType = fieldSpec.getFieldType();
         if (fieldType == FieldSpec.FieldType.DIMENSION) {
           physicalDimensionFieldSpecs.add((DimensionFieldSpec) fieldSpec);
@@ -212,25 +202,46 @@ public class MutableSegmentImpl implements MutableSegment {
     // Initialize for each column
     for (FieldSpec fieldSpec : _physicalFieldSpecs) {
       String column = fieldSpec.getName();
-      _numValuesInfoMap.put(column, new NumValuesInfo());
+
+      // Partition info
+      PartitionFunction partitionFunction = null;
+      int partitionId = 0;
+      if (column.equals(_partitionColumn)) {
+        partitionFunction = _partitionFunction;
+        partitionId = _partitionId;
+      }
 
       // Check whether to generate raw index for the column while consuming
       // Only support generating raw index on single-value columns that do not have inverted index while
       // consuming. After consumption completes and the segment is built, all single-value columns can have raw index
-      FieldSpec.DataType dataType = fieldSpec.getDataType();
+      DataType dataType = fieldSpec.getDataType();
       boolean isFixedWidthColumn = dataType.isFixedWidth();
-      int forwardIndexColumnSize = -1;
+      MutableForwardIndex forwardIndex;
+      BaseMutableDictionary dictionary;
       if (isNoDictionaryColumn(noDictionaryColumns, invertedIndexColumns, fieldSpec, column)) {
-        // no dictionary
-        // each forward index entry will be equal to size of data for that row
-        // For INT, LONG, FLOAT, DOUBLE it is equal to the number of fixed bytes used to store the value,
+        // No dictionary column (always single-valued)
+        assert fieldSpec.isSingleValueField();
+
+        dictionary = null;
+        String allocationContext =
+            buildAllocationContext(_segmentName, column, V1Constants.Indexes.RAW_SV_FORWARD_INDEX_FILE_EXTENSION);
         if (isFixedWidthColumn) {
-          forwardIndexColumnSize = dataType.size();
+          forwardIndex =
+              new FixedByteSVMutableForwardIndex(false, dataType, _capacity, _memoryManager, allocationContext);
+        } else {
+          // RealtimeSegmentStatsHistory does not have the stats for no-dictionary columns from previous consuming
+          // segments
+          // TODO: Add support for updating RealtimeSegmentStatsHistory with average column value size for no dictionary
+          //       columns as well
+          // TODO: Use the stats to get estimated average length
+          // Use a smaller capacity as opposed to segment flush size
+          int initialCapacity = Math.min(_capacity, NODICT_VARIABLE_WIDTH_ESTIMATED_NUMBER_OF_VALUES_DEFAULT);
+          forwardIndex = new VarByteSVMutableForwardIndex(dataType, _memoryManager, allocationContext, initialCapacity,
+              NODICT_VARIABLE_WIDTH_ESTIMATED_AVERAGE_VALUE_LENGTH_DEFAULT);
         }
       } else {
-        // dictionary encoded index
-        // each forward index entry will contain a 4 byte dictionary ID
-        forwardIndexColumnSize = FieldSpec.DataType.INT.size();
+        // Dictionary-encoded column
+
         int dictionaryColumnSize;
         if (isFixedWidthColumn) {
           dictionaryColumnSize = dataType.size();
@@ -239,75 +250,55 @@ public class MutableSegmentImpl implements MutableSegment {
         }
         // NOTE: preserve 10% buffer for cardinality to reduce the chance of re-sizing the dictionary
         int estimatedCardinality = (int) (_statsHistory.getEstimatedCardinality(column) * 1.1);
-        String allocationContext = buildAllocationContext(_segmentName, column, V1Constants.Dict.FILE_EXTENSION);
-        BaseMutableDictionary dictionary = MutableDictionaryFactory
+        String dictionaryAllocationContext =
+            buildAllocationContext(_segmentName, column, V1Constants.Dict.FILE_EXTENSION);
+        dictionary = MutableDictionaryFactory
             .getMutableDictionary(dataType, _offHeap, _memoryManager, dictionaryColumnSize,
-                Math.min(estimatedCardinality, _capacity), allocationContext);
-        _dictionaryMap.put(column, dictionary);
+                Math.min(estimatedCardinality, _capacity), dictionaryAllocationContext);
+
+        if (fieldSpec.isSingleValueField()) {
+          // Single-value dictionary-encoded forward index
+          String allocationContext = buildAllocationContext(_segmentName, column,
+              V1Constants.Indexes.UNSORTED_SV_FORWARD_INDEX_FILE_EXTENSION);
+          forwardIndex =
+              new FixedByteSVMutableForwardIndex(true, DataType.INT, _capacity, _memoryManager, allocationContext);
+        } else {
+          // Multi-value dictionary-encoded forward index
+          String allocationContext = buildAllocationContext(_segmentName, column,
+              V1Constants.Indexes.UNSORTED_MV_FORWARD_INDEX_FILE_EXTENSION);
+          // TODO: Start with a smaller capacity on FixedByteMVForwardIndexReaderWriter and let it expand
+          forwardIndex =
+              new FixedByteMVMutableForwardIndex(MAX_MULTI_VALUES_PER_ROW, avgNumMultiValues, _capacity, Integer.BYTES,
+                  _memoryManager, allocationContext);
+        }
 
         // Even though the column is defined as 'no-dictionary' in the config, we did create dictionary for consuming segment.
         noDictionaryColumns.remove(column);
       }
 
-      DataFileReader indexReaderWriter;
+      // Inverted index
+      RealtimeInvertedIndexReader invertedIndexReader =
+          invertedIndexColumns.contains(column) ? new RealtimeInvertedIndexReader() : null;
 
-      // create forward index reader/writer
-      if (forwardIndexColumnSize == -1) {
-        // for STRING/BYTES SV column, we support raw index in consuming segments
-        // RealtimeSegmentStatsHistory does not have the stats for no-dictionary columns
-        // from previous consuming segments
-        // TODO: Add support for updating RealtimeSegmentStatsHistory with average column value size for no dictionary columns as well
-        // TODO: Use the stats to get estimated average length
-        // Use a smaller capacity as opposed to segment flush size
-        int initialCapacity = Math.min(_capacity, NODICT_VARIABLE_WIDTH_ESTIMATED_NUMBER_OF_VALUES_DEFAULT);
-        String allocationContext =
-            buildAllocationContext(_segmentName, column, V1Constants.Indexes.UNSORTED_SV_FORWARD_INDEX_FILE_EXTENSION);
-        indexReaderWriter =
-            new VarByteSingleColumnSingleValueReaderWriter(_memoryManager, allocationContext, initialCapacity,
-                NODICT_VARIABLE_WIDTH_ESTIMATED_AVERAGE_VALUE_LENGTH_DEFAULT);
-      } else {
-        // two possible cases can lead here:
-        // (1) dictionary encoded forward index
-        // (2) raw forward index for fixed width types -- INT, LONG, FLOAT, DOUBLE
-        if (fieldSpec.isSingleValueField()) {
-          // SV column -- both dictionary encoded and raw index are supported on SV
-          // columns for both fixed and variable width types
-          String allocationContext = buildAllocationContext(_segmentName, column,
-              V1Constants.Indexes.UNSORTED_SV_FORWARD_INDEX_FILE_EXTENSION);
-          indexReaderWriter =
-              new FixedByteSingleColumnSingleValueReaderWriter(_capacity, forwardIndexColumnSize, _memoryManager,
-                  allocationContext);
-        } else {
-          // MV column -- only dictionary encoded index is supported on MV columns
-          // for both fixed and variable width types
-          // TODO: Start with a smaller capacity on FixedByteSingleColumnMultiValueReaderWriter and let it expand
-          String allocationContext = buildAllocationContext(_segmentName, column,
-              V1Constants.Indexes.UNSORTED_MV_FORWARD_INDEX_FILE_EXTENSION);
-          indexReaderWriter =
-              new FixedByteSingleColumnMultiValueReaderWriter(MAX_MULTI_VALUES_PER_ROW, avgNumMultiValues, _capacity,
-                  forwardIndexColumnSize, _memoryManager, allocationContext);
-        }
-      }
-
-      _indexReaderWriterMap.put(column, indexReaderWriter);
-
-      if (invertedIndexColumns.contains(column)) {
-        _invertedIndexMap.put(column, new RealtimeInvertedIndexReader());
-      }
-
-      if (_nullHandlingEnabled) {
-        _nullValueVectorMap.put(column, new RealtimeNullValueVectorReaderWriter());
-      }
-
+      // Text index
+      RealtimeLuceneTextIndexReader textIndex;
       if (textIndexColumns.contains(column)) {
-        RealtimeLuceneTextIndexReader realtimeLuceneIndexReader =
-            new RealtimeLuceneTextIndexReader(column, new File(config.getConsumerDir()), _segmentName);
-        _invertedIndexMap.put(column, realtimeLuceneIndexReader);
+        textIndex = new RealtimeLuceneTextIndexReader(column, new File(config.getConsumerDir()), _segmentName);
         if (_realtimeLuceneReaders == null) {
           _realtimeLuceneReaders = new RealtimeLuceneReaders(_segmentName);
         }
-        _realtimeLuceneReaders.addReader(realtimeLuceneIndexReader);
+        _realtimeLuceneReaders.addReader(textIndex);
+      } else {
+        textIndex = null;
       }
+
+      // Null value vector
+      MutableNullValueVector nullValueVector = _nullHandlingEnabled ? new MutableNullValueVector() : null;
+
+      // TODO: Support range index and bloom filter for mutable segment
+      _indexContainerMap.put(column,
+          new IndexContainer(fieldSpec, partitionFunction, partitionId, new NumValuesInfo(), forwardIndex, dictionary,
+              invertedIndexReader, null, textIndex, null, nullValueVector));
     }
 
     if (_realtimeLuceneReaders != null) {
@@ -331,7 +322,7 @@ public class MutableSegmentImpl implements MutableSegment {
    */
   private boolean isNoDictionaryColumn(Set<String> noDictionaryColumns, Set<String> invertedIndexColumns,
       FieldSpec fieldSpec, String column) {
-    FieldSpec.DataType dataType = fieldSpec.getDataType();
+    DataType dataType = fieldSpec.getDataType();
     if (noDictionaryColumns.contains(column)) {
       // Earlier we didn't support noDict in consuming segments for STRING and BYTES columns.
       // So even if the user had the column in noDictionaryColumns set in table config, we still
@@ -343,10 +334,11 @@ public class MutableSegmentImpl implements MutableSegment {
       // of noDict on STRING/BYTES. Without metrics aggregation, memory pressure increases.
       // So to continue aggregating metrics for such cases, we will create dictionary even
       // if the column is part of noDictionary set from table config
-      if (fieldSpec instanceof DimensionFieldSpec && _aggregateMetrics && (dataType == FieldSpec.DataType.STRING ||
-          dataType == FieldSpec.DataType.BYTES)) {
-        _logger.info("Aggregate metrics is enabled. Will create dictionary in consuming segment for column {} of type {}",
-            column, dataType.toString());
+      if (fieldSpec instanceof DimensionFieldSpec && _aggregateMetrics && (dataType == DataType.STRING
+          || dataType == DataType.BYTES)) {
+        _logger
+            .info("Aggregate metrics is enabled. Will create dictionary in consuming segment for column {} of type {}",
+                column, dataType.toString());
         return false;
       }
       // So don't create dictionary if the column is member of noDictionary, is single-value
@@ -366,12 +358,42 @@ public class MutableSegmentImpl implements MutableSegment {
     }
   }
 
+  /**
+   * Get min time from the segment, based on the time column, only used by Kafka HLC.
+   */
+  @Deprecated
   public long getMinTime() {
-    return _minTime;
+    Long minTime = extractTimeValue(_indexContainerMap.get(_timeColumnName)._minValue);
+    if (minTime != null) {
+      return minTime;
+    }
+    return Long.MAX_VALUE;
   }
 
+  /**
+   * Get max time from the segment, based on the time column, only used by Kafka HLC.
+   */
+  @Deprecated
   public long getMaxTime() {
-    return _maxTime;
+    Long maxTime = extractTimeValue(_indexContainerMap.get(_timeColumnName)._maxValue);
+    if (maxTime != null) {
+      return maxTime;
+    }
+    return Long.MIN_VALUE;
+  }
+
+  private Long extractTimeValue(Comparable time) {
+    if (time != null) {
+      if (time instanceof Number) {
+        return ((Number) time).longValue();
+      } else {
+        String stringValue = time.toString();
+        if (StringUtils.isNumeric(stringValue)) {
+          return Long.parseLong(stringValue);
+        }
+      }
+    }
+    return null;
   }
 
   public void addExtraColumns(Schema newSchema) {
@@ -387,204 +409,194 @@ public class MutableSegmentImpl implements MutableSegment {
     _logger.info("Newly added columns: " + _newlyAddedColumnsFieldMap.toString());
   }
 
+  // NOTE: Okay for single-writer
+  @SuppressWarnings("NonAtomicOperationOnVolatileField")
   @Override
   public boolean index(GenericRow row, @Nullable RowMetadata rowMetadata) {
-    boolean canTakeMore;
     // Update dictionary first
-    Map<String, Object> dictIdMap = updateDictionary(row);
-
-    int numDocs = _numDocsIndexed;
+    updateDictionary(row);
 
     // If metrics aggregation is enabled and if the dimension values were already seen, this will return existing docId,
     // else this will return a new docId.
-    int docId = getOrCreateDocId(dictIdMap);
+    int docId = getOrCreateDocId();
 
-    // docId == numDocs implies new docId.
-    if (docId == numDocs) {
-      // Add forward and inverted indices for new document.
-      addForwardIndex(row, docId, dictIdMap);
-      addInvertedIndex(row, docId, dictIdMap);
-      if (_nullHandlingEnabled) {
-        handleNullValues(row, docId);
-      }
-
-      // Update number of document indexed at last to make the latest record queryable
+    boolean canTakeMore;
+    if (docId == _numDocsIndexed) {
+      // New row
+      addNewRow(row);
+      // Update number of documents indexed at last to make the latest row queryable
       canTakeMore = _numDocsIndexed++ < _capacity;
     } else {
-      Preconditions
-          .checkState(_aggregateMetrics, "Invalid document-id during indexing: " + docId + " expected: " + numDocs);
-      // Update metrics for existing document.
-      canTakeMore = aggregateMetrics(row, docId);
+      // Aggregate metrics for an existing row
+      assert _aggregateMetrics;
+      aggregateMetrics(row, docId);
+      canTakeMore = true;
     }
 
+    // Update last indexed time and latest ingestion time
     _lastIndexedTimeMs = System.currentTimeMillis();
-
-    if (rowMetadata != null && rowMetadata.getIngestionTimeMs() != Long.MIN_VALUE) {
+    if (rowMetadata != null) {
       _latestIngestionTimeMs = Math.max(_latestIngestionTimeMs, rowMetadata.getIngestionTimeMs());
     }
+
     return canTakeMore;
   }
 
-  private Map<String, Object> updateDictionary(GenericRow row) {
-    Map<String, Object> dictIdMap = new HashMap<>();
-    for (FieldSpec fieldSpec : _physicalFieldSpecs) {
-      String column = fieldSpec.getName();
+  private void updateDictionary(GenericRow row) {
+    for (Map.Entry<String, IndexContainer> entry : _indexContainerMap.entrySet()) {
+      String column = entry.getKey();
+      IndexContainer indexContainer = entry.getValue();
       Object value = row.getValue(column);
-
-      BaseMutableDictionary dictionary = _dictionaryMap.get(column);
+      BaseMutableDictionary dictionary = indexContainer._dictionary;
       if (dictionary != null) {
-        if (fieldSpec.isSingleValueField()) {
-          dictIdMap.put(column, dictionary.index(value));
+        if (indexContainer._fieldSpec.isSingleValueField()) {
+          indexContainer._dictId = dictionary.index(value);
         } else {
-          int[] dictIds = dictionary.index((Object[]) value);
-          dictIdMap.put(column, dictIds);
-
-          // No need to update min/max time value as time column cannot be multi-valued
-          continue;
+          indexContainer._dictIds = dictionary.index((Object[]) value);
         }
-      }
 
-      // Update min/max value for time column
-      if (column.equals(_timeColumnName)) {
-        long timeValue;
-        if (value instanceof Number) {
-          timeValue = ((Number) value).longValue();
-          _minTime = Math.min(_minTime, timeValue);
-          _maxTime = Math.max(_maxTime, timeValue);
-        } else {
-          String stringValue = value.toString();
-          if (StringUtils.isNumeric(stringValue)) {
-            timeValue = Long.parseLong(stringValue);
-            _minTime = Math.min(_minTime, timeValue);
-            _maxTime = Math.max(_maxTime, timeValue);
-          }
-        }
+        // Update min/max value from dictionary
+        indexContainer._minValue = dictionary.getMinVal();
+        indexContainer._maxValue = dictionary.getMaxVal();
       }
     }
-    return dictIdMap;
   }
 
-  private void addForwardIndex(GenericRow row, int docId, Map<String, Object> dictIdMap) {
-    // Store dictionary Id(s) for columns with dictionary
-    for (FieldSpec fieldSpec : _physicalFieldSpecs) {
-      String column = fieldSpec.getName();
+  private void addNewRow(GenericRow row) {
+    int docId = _numDocsIndexed;
+    for (Map.Entry<String, IndexContainer> entry : _indexContainerMap.entrySet()) {
+      String column = entry.getKey();
+      IndexContainer indexContainer = entry.getValue();
       Object value = row.getValue(column);
-      NumValuesInfo numValuesInfo = _numValuesInfoMap.get(column);
+      FieldSpec fieldSpec = indexContainer._fieldSpec;
       if (fieldSpec.isSingleValueField()) {
-        // SV column
-        BaseSingleColumnSingleValueReaderWriter indexReaderWriter =
-            (BaseSingleColumnSingleValueReaderWriter) _indexReaderWriterMap.get(column);
-        Integer dictId = (Integer) dictIdMap.get(column);
-        if (dictId != null) {
-          // SV Column with dictionary
-          indexReaderWriter.setInt(docId, dictId);
+        // Single-value column
+
+        // Update numValues info
+        indexContainer._numValuesInfo.updateSVEntry();
+
+        // Update indexes
+        MutableForwardIndex forwardIndex = indexContainer._forwardIndex;
+        int dictId = indexContainer._dictId;
+        if (dictId >= 0) {
+          // Dictionary-encoded single-value column
+
+          // Update forward index
+          forwardIndex.setDictId(docId, dictId);
+
+          // Update inverted index
+          RealtimeInvertedIndexReader invertedIndex = indexContainer._invertedIndex;
+          if (invertedIndex != null) {
+            invertedIndex.add(dictId, docId);
+          }
         } else {
-          // No-dictionary SV column
-          FieldSpec.DataType dataType = fieldSpec.getDataType();
+          // Single-value column with raw index
+
+          // Update forward index
+          DataType dataType = fieldSpec.getDataType();
           switch (dataType) {
             case INT:
-              indexReaderWriter.setInt(docId, (Integer) value);
+              forwardIndex.setInt(docId, (Integer) value);
               break;
             case LONG:
-              indexReaderWriter.setLong(docId, (Long) value);
+              forwardIndex.setLong(docId, (Long) value);
               break;
             case FLOAT:
-              indexReaderWriter.setFloat(docId, (Float) value);
+              forwardIndex.setFloat(docId, (Float) value);
               break;
             case DOUBLE:
-              indexReaderWriter.setDouble(docId, (Double) value);
+              forwardIndex.setDouble(docId, (Double) value);
               break;
             case STRING:
-              indexReaderWriter.setString(docId, (String) value);
+              forwardIndex.setString(docId, (String) value);
               break;
             case BYTES:
-              indexReaderWriter.setBytes(docId, (byte[]) value);
+              forwardIndex.setBytes(docId, (byte[]) value);
               break;
             default:
               throw new UnsupportedOperationException(
                   "Unsupported data type: " + dataType + " for no-dictionary column: " + column);
           }
-        }
 
-        numValuesInfo.updateSVEntry();
-      } else {
-        // MV column: always dictionary encoded
-        int[] dictIds = (int[]) dictIdMap.get(column);
-        ((FixedByteSingleColumnMultiValueReaderWriter) _indexReaderWriterMap.get(column)).setIntArray(docId, dictIds);
-
-        numValuesInfo.updateMVEntry(dictIds.length);
-      }
-    }
-  }
-
-  private void addInvertedIndex(GenericRow row, int docId, Map<String, Object> dictIdMap) {
-    // Update inverted index at last
-    // NOTE: inverted index have to be updated at last because once it gets updated, the latest record will become
-    // queryable
-    for (FieldSpec fieldSpec : _physicalFieldSpecs) {
-      String column = fieldSpec.getName();
-      InvertedIndexReader invertedIndex = _invertedIndexMap.get(column);
-      if (invertedIndex != null) {
-        if (invertedIndex instanceof RealtimeLuceneTextIndexReader) {
-          ((RealtimeLuceneTextIndexReader) invertedIndex).addDoc(row.getValue(column), docId);
-        } else {
-          RealtimeInvertedIndexReader realtimeInvertedIndexReader = (RealtimeInvertedIndexReader) invertedIndex;
-          if (fieldSpec.isSingleValueField()) {
-            realtimeInvertedIndexReader.add(((Integer) dictIdMap.get(column)), docId);
-          } else {
-            int[] dictIds = (int[]) dictIdMap.get(column);
-            for (int dictId : dictIds) {
-              realtimeInvertedIndexReader.add(dictId, docId);
+          // Update min/max value from raw value
+          // NOTE: Skip updating min/max value for aggregated metrics because the value will change over time.
+          if (!_aggregateMetrics || fieldSpec.getFieldType() != FieldSpec.FieldType.METRIC) {
+            Comparable comparable;
+            if (dataType == DataType.BYTES) {
+              comparable = new ByteArray((byte[]) value);
+            } else {
+              comparable = (Comparable) value;
+            }
+            if (indexContainer._minValue == null) {
+              indexContainer._minValue = comparable;
+              indexContainer._maxValue = comparable;
+            } else {
+              if (comparable.compareTo(indexContainer._minValue) < 0) {
+                indexContainer._minValue = comparable;
+              }
+              if (comparable.compareTo(indexContainer._maxValue) > 0) {
+                indexContainer._maxValue = comparable;
+              }
             }
           }
         }
+
+        // Update text index
+        RealtimeLuceneTextIndexReader textIndex = indexContainer._textIndex;
+        if (textIndex != null) {
+          textIndex.addDoc(value, docId);
+        }
+      } else {
+        // Multi-value column (always dictionary-encoded)
+
+        int[] dictIds = indexContainer._dictIds;
+
+        // Update numValues info
+        indexContainer._numValuesInfo.updateMVEntry(dictIds.length);
+
+        // Update forward index
+        indexContainer._forwardIndex.setDictIdMV(docId, dictIds);
+
+        // Update inverted index
+        RealtimeInvertedIndexReader invertedIndex = indexContainer._invertedIndex;
+        if (invertedIndex != null) {
+          for (int dictId : dictIds) {
+            invertedIndex.add(dictId, docId);
+          }
+        }
+      }
+
+      // Update null value vector
+      if (_nullHandlingEnabled && row.isNullValue(column)) {
+        indexContainer._nullValueVector.setNull(docId);
       }
     }
   }
 
-  /**
-   * Check if the row has any null fields and update the
-   * column null value vectors accordingly
-   * @param row specifies row being ingested
-   * @param docId specified docId for this row
-   */
-  private void handleNullValues(GenericRow row, int docId) {
-    if (!row.hasNullValues()) {
-      return;
-    }
-
-    for (String columnName : row.getNullValueFields()) {
-      _nullValueVectorMap.get(columnName).setNull(docId);
-    }
-  }
-
-  private boolean aggregateMetrics(GenericRow row, int docId) {
+  private void aggregateMetrics(GenericRow row, int docId) {
     for (MetricFieldSpec metricFieldSpec : _physicalMetricFieldSpecs) {
       String column = metricFieldSpec.getName();
       Object value = row.getValue(column);
-      FixedByteSingleColumnSingleValueReaderWriter indexReaderWriter =
-          (FixedByteSingleColumnSingleValueReaderWriter) _indexReaderWriterMap.get(column);
-
-      FieldSpec.DataType dataType = metricFieldSpec.getDataType();
+      MutableForwardIndex forwardIndex = _indexContainerMap.get(column)._forwardIndex;
+      DataType dataType = metricFieldSpec.getDataType();
       switch (dataType) {
         case INT:
-          indexReaderWriter.setInt(docId, (Integer) value + indexReaderWriter.getInt(docId));
+          forwardIndex.setInt(docId, (Integer) value + forwardIndex.getInt(docId));
           break;
         case LONG:
-          indexReaderWriter.setLong(docId, (Long) value + indexReaderWriter.getLong(docId));
+          forwardIndex.setLong(docId, (Long) value + forwardIndex.getLong(docId));
           break;
         case FLOAT:
-          indexReaderWriter.setFloat(docId, (Float) value + indexReaderWriter.getFloat(docId));
+          forwardIndex.setFloat(docId, (Float) value + forwardIndex.getFloat(docId));
           break;
         case DOUBLE:
-          indexReaderWriter.setDouble(docId, (Double) value + indexReaderWriter.getDouble(docId));
+          forwardIndex.setDouble(docId, (Double) value + forwardIndex.getDouble(docId));
           break;
         default:
           throw new UnsupportedOperationException(
-              "Unsupported data type: " + dataType + " for no-dictionary column: " + column);
+              "Unsupported data type: " + dataType + " for aggregate metric column: " + column);
       }
     }
-    return true;
   }
 
   @Override
@@ -627,7 +639,8 @@ public class MutableSegmentImpl implements MutableSegment {
       if (fieldSpec == null) {
         // If the column was added during ingestion, we will construct the column provider based on its fieldSpec to provide values
         fieldSpec = _newlyAddedColumnsFieldMap.get(column);
-        Preconditions.checkNotNull(fieldSpec, "FieldSpec for " + column + " should not be null");
+        Preconditions.checkNotNull(fieldSpec,
+            "FieldSpec for " + column + " should not be null. " + "Potentially invalid column name specified.");
       }
       // TODO: Refactor virtual column provider to directly generate data source
       VirtualColumnContext virtualColumnContext = new VirtualColumnContext(fieldSpec, _numDocsIndexed);
@@ -635,22 +648,7 @@ public class MutableSegmentImpl implements MutableSegment {
       return new ImmutableDataSource(virtualColumnProvider.buildMetadata(virtualColumnContext),
           virtualColumnProvider.buildColumnIndexContainer(virtualColumnContext));
     } else {
-      PartitionFunction partitionFunction = null;
-      int partitionId = 0;
-      if (column.equals(_partitionColumn)) {
-        partitionFunction = _partitionFunction;
-        partitionId = _partitionId;
-      }
-      NumValuesInfo numValuesInfo = _numValuesInfoMap.get(column);
-      DataFileReader forwardIndex = _indexReaderWriterMap.get(column);
-      BaseMutableDictionary dictionary = _dictionaryMap.get(column);
-      InvertedIndexReader invertedIndex = _invertedIndexMap.get(column);
-      InvertedIndexReader rangeIndex = _rangeIndexMap.get(column);
-      BloomFilterReader bloomFilter = _bloomFilterMap.get(column);
-      RealtimeNullValueVectorReaderWriter nullValueVector = _nullValueVectorMap.get(column);
-      return new MutableDataSource(fieldSpec, _numDocsIndexed, numValuesInfo.getNumValues(),
-          numValuesInfo.getMaxNumValuesPerMVEntry(), partitionFunction, partitionId, forwardIndex, dictionary,
-          invertedIndex, rangeIndex, bloomFilter, nullValueVector);
+      return _indexContainerMap.get(column).toDataSource();
     }
   }
 
@@ -666,22 +664,57 @@ public class MutableSegmentImpl implements MutableSegment {
    * @return Generic row with physical columns of the specified row.
    */
   public GenericRow getRecord(int docId, GenericRow reuse) {
-    for (FieldSpec fieldSpec : _physicalFieldSpecs) {
-      String column = fieldSpec.getName();
-      Object value = IndexSegmentUtils
-          .getValue(docId, fieldSpec, _indexReaderWriterMap.get(column), _dictionaryMap.get(column),
-              _numValuesInfoMap.get(column).getMaxNumValuesPerMVEntry());
-      reuse.putValue(column, value);
-
-      if (_nullHandlingEnabled) {
-        NullValueVectorReader reader = _nullValueVectorMap.get(column);
-        // If column has null value for this docId, set that accordingly in GenericRow
-        if (reader.isNull(docId)) {
-          reuse.putDefaultNullValue(column, value);
-        }
+    for (Map.Entry<String, IndexContainer> entry : _indexContainerMap.entrySet()) {
+      String column = entry.getKey();
+      IndexContainer indexContainer = entry.getValue();
+      Object value = getValue(docId, indexContainer._forwardIndex, indexContainer._dictionary,
+          indexContainer._numValuesInfo._maxNumValuesPerMVEntry);
+      if (_nullHandlingEnabled && indexContainer._nullValueVector.isNull(docId)) {
+        reuse.putDefaultNullValue(column, value);
+      } else {
+        reuse.putValue(column, value);
       }
     }
     return reuse;
+  }
+
+  /**
+   * Helper method to read the value for the given document id.
+   */
+  private static Object getValue(int docId, MutableForwardIndex forwardIndex,
+      @Nullable BaseMutableDictionary dictionary, int maxNumMultiValues) {
+    if (dictionary != null) {
+      // Dictionary based
+      if (forwardIndex.isSingleValue()) {
+        int dictId = forwardIndex.getDictId(docId);
+        return dictionary.get(dictId);
+      } else {
+        int[] dictIds = new int[maxNumMultiValues];
+        int numValues = forwardIndex.getDictIdMV(docId, dictIds);
+        Object[] value = new Object[numValues];
+        for (int i = 0; i < numValues; i++) {
+          value[i] = dictionary.get(dictIds[i]);
+        }
+        return value;
+      }
+    } else {
+      // Raw index based
+      // TODO: support multi-valued column
+      switch (forwardIndex.getValueType()) {
+        case INT:
+          return forwardIndex.getInt(docId);
+        case LONG:
+          return forwardIndex.getLong(docId);
+        case FLOAT:
+          return forwardIndex.getFloat(docId);
+        case DOUBLE:
+          return forwardIndex.getDouble(docId);
+        case STRING:
+          return forwardIndex.getString(docId);
+        default:
+          throw new IllegalStateException();
+      }
+    }
   }
 
   @Override
@@ -698,13 +731,15 @@ public class MutableSegmentImpl implements MutableSegment {
                 numSeconds);
 
         RealtimeSegmentStatsHistory.SegmentStats segmentStats = new RealtimeSegmentStatsHistory.SegmentStats();
-        for (Map.Entry<String, BaseMutableDictionary> entry : _dictionaryMap.entrySet()) {
-          String columnName = entry.getKey();
-          BaseOffHeapMutableDictionary dictionary = (BaseOffHeapMutableDictionary) entry.getValue();
-          RealtimeSegmentStatsHistory.ColumnStats columnStats = new RealtimeSegmentStatsHistory.ColumnStats();
-          columnStats.setCardinality(dictionary.length());
-          columnStats.setAvgColumnSize(dictionary.getAvgValueSize());
-          segmentStats.setColumnStats(columnName, columnStats);
+        for (Map.Entry<String, IndexContainer> entry : _indexContainerMap.entrySet()) {
+          String column = entry.getKey();
+          BaseOffHeapMutableDictionary dictionary = (BaseOffHeapMutableDictionary) entry.getValue()._dictionary;
+          if (dictionary != null) {
+            RealtimeSegmentStatsHistory.ColumnStats columnStats = new RealtimeSegmentStatsHistory.ColumnStats();
+            columnStats.setCardinality(dictionary.length());
+            columnStats.setAvgColumnSize(dictionary.getAvgValueSize());
+            segmentStats.setColumnStats(column, columnStats);
+          }
         }
         segmentStats.setNumRowsConsumed(_numDocsIndexed);
         segmentStats.setNumRowsIndexed(_numDocsIndexed);
@@ -714,47 +749,22 @@ public class MutableSegmentImpl implements MutableSegment {
       }
     }
 
-    for (DataFileReader dfReader : _indexReaderWriterMap.values()) {
-      try {
-        dfReader.close();
-      } catch (IOException e) {
-        _logger.error("Failed to close index. Service will continue with potential memory leak, error: ", e);
-        // fall through to close other segments
-      }
-    }
-    // clear map now that index is closed to prevent accidental usage
-    _indexReaderWriterMap.clear();
-
-    for (InvertedIndexReader index : _invertedIndexMap.values()) {
-      if (index instanceof RealtimeInvertedIndexReader) {
-        ((RealtimeInvertedIndexReader) index).close();
-      }
-    }
-    _invertedIndexMap.clear();
-
+    // Stop the text index refresh before closing the indexes
     if (_realtimeLuceneReaders != null) {
       // set this to true as a way of signalling the refresh task thread to
       // not attempt refresh on this segment here onwards
       _realtimeLuceneReaders.getLock().lock();
-      _realtimeLuceneReaders.setSegmentDestroyed();
       try {
-        for (RealtimeLuceneTextIndexReader realtimeLuceneReader : _realtimeLuceneReaders.getRealtimeLuceneReaders()) {
-          // close each realtime lucene reader for this segment
-          realtimeLuceneReader.close();
-        }
-        // clear the list.
+        _realtimeLuceneReaders.setSegmentDestroyed();
         _realtimeLuceneReaders.clearRealtimeReaderList();
       } finally {
         _realtimeLuceneReaders.getLock().unlock();
       }
     }
 
-    for (Map.Entry<String, BaseMutableDictionary> entry : _dictionaryMap.entrySet()) {
-      try {
-        entry.getValue().close();
-      } catch (IOException e) {
-        _logger.error("Failed to close the dictionary for column: {}. Continuing with error.", entry.getKey(), e);
-      }
+    // Close the indexes
+    for (IndexContainer indexContainer : _indexContainerMap.values()) {
+      indexContainer.close();
     }
 
     if (_recordIdMap != null) {
@@ -783,16 +793,19 @@ public class MutableSegmentImpl implements MutableSegment {
    * @return The docIds to use for iteration
    */
   public int[] getSortedDocIdIterationOrderWithSortedColumn(String column) {
-    BaseMutableDictionary dictionary = _dictionaryMap.get(column);
-    int numValues = dictionary.length();
+    IndexContainer indexContainer = _indexContainerMap.get(column);
+    BaseMutableDictionary dictionary = indexContainer._dictionary;
 
+    // Sort all values in the dictionary
+    int numValues = dictionary.length();
     int[] dictIds = new int[numValues];
     for (int i = 0; i < numValues; i++) {
       dictIds[i] = i;
     }
+    IntArrays.quickSort(dictIds, dictionary::compare);
 
-    IntArrays.quickSort(dictIds, (dictId1, dictId2) -> dictionary.compare(dictId1, dictId2));
-    RealtimeInvertedIndexReader invertedIndex = (RealtimeInvertedIndexReader) _invertedIndexMap.get(column);
+    // Re-order documents using the inverted index
+    RealtimeInvertedIndexReader invertedIndex = indexContainer._invertedIndex;
     int[] docIds = new int[_numDocsIndexed];
     int docIdIndex = 0;
     for (int dictId : dictIds) {
@@ -822,7 +835,7 @@ public class MutableSegmentImpl implements MutableSegment {
     return segmentName + ":" + columnName + indexType;
   }
 
-  private int getOrCreateDocId(Map<String, Object> dictIdMap) {
+  private int getOrCreateDocId() {
     if (!_aggregateMetrics) {
       return _numDocsIndexed;
     }
@@ -832,10 +845,10 @@ public class MutableSegmentImpl implements MutableSegment {
 
     // FIXME: this for loop breaks for multi value dimensions. https://github.com/apache/incubator-pinot/issues/3867
     for (FieldSpec fieldSpec : _physicalDimensionFieldSpecs) {
-      dictIds[i++] = (Integer) dictIdMap.get(fieldSpec.getName());
+      dictIds[i++] = _indexContainerMap.get(fieldSpec.getName())._dictId;
     }
     for (String timeColumnName : _physicalTimeColumnNames) {
-      dictIds[i++] = (Integer) dictIdMap.get(timeColumnName);
+      dictIds[i++] = _indexContainerMap.get(timeColumnName)._dictId;
     }
     return _recordIdMap.put(new FixedIntArray(dictIds));
   }
@@ -949,13 +962,89 @@ public class MutableSegmentImpl implements MutableSegment {
       _numValues += numValuesInMVEntry;
       _maxNumValuesPerMVEntry = Math.max(_maxNumValuesPerMVEntry, numValuesInMVEntry);
     }
+  }
 
-    int getNumValues() {
-      return _numValues;
+  private class IndexContainer implements Closeable {
+    final FieldSpec _fieldSpec;
+    final PartitionFunction _partitionFunction;
+    final int _partitionId;
+    final NumValuesInfo _numValuesInfo;
+    final MutableForwardIndex _forwardIndex;
+    final BaseMutableDictionary _dictionary;
+    final RealtimeInvertedIndexReader _invertedIndex;
+    final InvertedIndexReader _rangeIndex;
+    final RealtimeLuceneTextIndexReader _textIndex;
+    final BloomFilterReader _bloomFilter;
+    final MutableNullValueVector _nullValueVector;
+
+    volatile Comparable _minValue;
+    volatile Comparable _maxValue;
+
+    // Hold the dictionary id for the latest record
+    int _dictId = Integer.MIN_VALUE;
+    int[] _dictIds;
+
+    IndexContainer(FieldSpec fieldSpec, @Nullable PartitionFunction partitionFunction, int partitionId,
+        NumValuesInfo numValuesInfo, MutableForwardIndex forwardIndex, @Nullable BaseMutableDictionary dictionary,
+        @Nullable RealtimeInvertedIndexReader invertedIndex, @Nullable InvertedIndexReader rangeIndex,
+        @Nullable RealtimeLuceneTextIndexReader textIndex, @Nullable BloomFilterReader bloomFilter,
+        @Nullable MutableNullValueVector nullValueVector) {
+      _fieldSpec = fieldSpec;
+      _partitionFunction = partitionFunction;
+      _partitionId = partitionId;
+      _numValuesInfo = numValuesInfo;
+      _forwardIndex = forwardIndex;
+      _dictionary = dictionary;
+      _invertedIndex = invertedIndex;
+      _rangeIndex = rangeIndex;
+      _textIndex = textIndex;
+      _bloomFilter = bloomFilter;
+      _nullValueVector = nullValueVector;
     }
 
-    int getMaxNumValuesPerMVEntry() {
-      return _maxNumValuesPerMVEntry;
+    DataSource toDataSource() {
+      return new MutableDataSource(_fieldSpec, _numDocsIndexed, _numValuesInfo._numValues,
+          _numValuesInfo._maxNumValuesPerMVEntry, _partitionFunction, _partitionId, _minValue, _maxValue, _forwardIndex,
+          _dictionary, _invertedIndex, _rangeIndex, _textIndex, _bloomFilter, _nullValueVector);
+    }
+
+    @Override
+    public void close() {
+      String column = _fieldSpec.getName();
+      try {
+        _forwardIndex.close();
+      } catch (Exception e) {
+        _logger.error("Caught exception while closing forward index for column: {}, continuing with error", column, e);
+      }
+      if (_dictionary != null) {
+        try {
+          _dictionary.close();
+        } catch (Exception e) {
+          _logger.error("Caught exception while closing dictionary for column: {}, continuing with error", column, e);
+        }
+      }
+      if (_invertedIndex != null) {
+        try {
+          _invertedIndex.close();
+        } catch (Exception e) {
+          _logger
+              .error("Caught exception while closing inverted index for column: {}, continuing with error", column, e);
+        }
+      }
+      if (_rangeIndex != null) {
+        try {
+          _rangeIndex.close();
+        } catch (Exception e) {
+          _logger.error("Caught exception while closing range index for column: {}, continuing with error", column, e);
+        }
+      }
+      if (_textIndex != null) {
+        try {
+          _textIndex.close();
+        } catch (Exception e) {
+          _logger.error("Caught exception while closing text index for column: {}, continuing with error", column, e);
+        }
+      }
     }
   }
 }

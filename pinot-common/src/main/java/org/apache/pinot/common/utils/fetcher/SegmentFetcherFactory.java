@@ -20,11 +20,15 @@ package org.apache.pinot.common.utils.fetcher;
 
 import java.io.File;
 import java.net.URI;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import org.apache.commons.configuration.BaseConfiguration;
-import org.apache.commons.configuration.Configuration;
+
+import org.apache.pinot.common.utils.CommonConstants;
+import org.apache.pinot.spi.crypt.PinotCrypter;
+import org.apache.pinot.spi.crypt.PinotCrypterFactory;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,18 +37,17 @@ public class SegmentFetcherFactory {
   private SegmentFetcherFactory() {
   }
 
-  public static final String PROTOCOLS_KEY = "protocols";
-  public static final String SEGMENT_FETCHER_CLASS_KEY_SUFFIX = ".class";
+  static final String SEGMENT_FETCHER_CLASS_KEY_SUFFIX = ".class";
+  private static final String PROTOCOLS_KEY = "protocols";
+  private static final String ENCODED_SUFFIX = ".enc";
 
   private static final Logger LOGGER = LoggerFactory.getLogger(SegmentFetcherFactory.class);
   private static final Map<String, SegmentFetcher> SEGMENT_FETCHER_MAP = new HashMap<>();
-  private static final String HTTP_PROTOCOL = "http";
-  private static final String HTTPS_PROTOCOL = "https";
   private static final SegmentFetcher DEFAULT_HTTP_SEGMENT_FETCHER = new HttpSegmentFetcher();
   private static final SegmentFetcher DEFAULT_PINOT_FS_SEGMENT_FETCHER = new PinotFSSegmentFetcher();
 
   static {
-    Configuration emptyConfig = new BaseConfiguration();
+    PinotConfiguration emptyConfig = new PinotConfiguration();
     DEFAULT_HTTP_SEGMENT_FETCHER.init(emptyConfig);
     DEFAULT_PINOT_FS_SEGMENT_FETCHER.init(emptyConfig);
   }
@@ -52,20 +55,19 @@ public class SegmentFetcherFactory {
   /**
    * Initializes the segment fetcher factory. This method should only be called once.
    */
-  public static void init(Configuration config)
+  public static void init(PinotConfiguration config)
       throws Exception {
-    @SuppressWarnings("unchecked")
-    List<String> protocols = config.getList(PROTOCOLS_KEY);
+    List<String> protocols = config.getProperty(PROTOCOLS_KEY, Arrays.asList());
     for (String protocol : protocols) {
-      String segmentFetcherClassName = config.getString(protocol + SEGMENT_FETCHER_CLASS_KEY_SUFFIX);
+      String segmentFetcherClassName = config.getProperty(protocol + SEGMENT_FETCHER_CLASS_KEY_SUFFIX);
       SegmentFetcher segmentFetcher;
       if (segmentFetcherClassName == null) {
         LOGGER.info("Segment fetcher class is not configured for protocol: {}, using default", protocol);
         switch (protocol) {
-          case HTTP_PROTOCOL:
+          case CommonConstants.HTTP_PROTOCOL:
             segmentFetcher = new HttpSegmentFetcher();
             break;
-          case HTTPS_PROTOCOL:
+          case CommonConstants.HTTPS_PROTOCOL:
             segmentFetcher = new HttpsSegmentFetcher();
             break;
           default:
@@ -91,8 +93,8 @@ public class SegmentFetcherFactory {
     } else {
       LOGGER.info("Segment fetcher is not configured for protocol: {}, using default", protocol);
       switch (protocol) {
-        case HTTP_PROTOCOL:
-        case HTTPS_PROTOCOL:
+        case CommonConstants.HTTP_PROTOCOL:
+        case CommonConstants.HTTPS_PROTOCOL:
           return DEFAULT_HTTP_SEGMENT_FETCHER;
         default:
           return DEFAULT_PINOT_FS_SEGMENT_FETCHER;
@@ -114,5 +116,25 @@ public class SegmentFetcherFactory {
   public static void fetchSegmentToLocal(String uri, File dest)
       throws Exception {
     fetchSegmentToLocal(new URI(uri), dest);
+  }
+
+  /**
+   * Fetches a segment from a URI location to a local file and decrypts it if needed
+   * @param uri remote segment location
+   * @param dest local file
+   */
+  public static void fetchAndDecryptSegmentToLocal(String uri, File dest, String crypterName)
+      throws Exception {
+    if (crypterName == null) {
+      fetchSegmentToLocal(uri, dest);
+    } else {
+      // download
+      File tempDownloadedFile = new File(dest.getPath() + ENCODED_SUFFIX);
+      fetchSegmentToLocal(uri, tempDownloadedFile);
+
+      // decrypt
+      PinotCrypter crypter = PinotCrypterFactory.create(crypterName);
+      crypter.decrypt(tempDownloadedFile, dest);
+    }
   }
 }

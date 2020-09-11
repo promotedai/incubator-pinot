@@ -31,7 +31,7 @@
 
   <groupId>org.apache.pinot</groupId>
   <artifactId>pinot</artifactId>
-  <version>${revision}${sha1}</version>
+  <version>0.5.0-SNAPSHOT</version>
   <packaging>pom</packaging>
   <name>Pinot</name>
   <description>A realtime distributed OLAP datastore</description>
@@ -51,6 +51,7 @@
     <module>pinot-perf</module>
     <module>pinot-integration-tests</module>
     <module>pinot-distribution</module>
+    <module>pinot-connectors</module>
   </modules>
 
   <licenses>
@@ -99,8 +100,6 @@
 
   <properties>
     <pinot.root>${basedir}</pinot.root>
-    <revision>0.5.0</revision>
-    <sha1>-SNAPSHOT</sha1>
     <build.profile.id>dev</build.profile.id>
     <jdk.version>1.8</jdk.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -139,10 +138,12 @@
     <!-- hadoop-common, spark-core use commons-net -->
     <commons-net.version>3.1</commons-net.version>
     <!-- helix-core, spark-core use libraries from io.dropwizard.metrics -->
-    <dropwizard-metrics.version>3.2.3</dropwizard-metrics.version>
+    <dropwizard-metrics.version>4.1.2</dropwizard-metrics.version>
     <snappy-java.version>1.1.1.7</snappy-java.version>
     <log4j.version>2.11.2</log4j.version>
     <netty.version>4.1.42.Final</netty.version>
+    <jts.version>1.16.1</jts.version>
+    <jmh.version>1.21</jmh.version>
 
     <!-- Sets the VM argument line used when unit tests are run. -->
     <argLine>-Xms4g -Xmx4g</argLine>
@@ -152,6 +153,8 @@
     To change kafka connector dependency, we only need to update this version number config.
     TODO: figure out a way to inject kafka dependency instead of explicitly setting the kafka module dependency -->
     <kafka.version>2.0</kafka.version>
+    <protobuf.version>3.12.0</protobuf.version>
+    <grpc.version>1.30.0</grpc.version>
   </properties>
 
   <profiles>
@@ -245,12 +248,12 @@
       <dependency>
         <groupId>org.apache.httpcomponents</groupId>
         <artifactId>httpclient</artifactId>
-        <version>4.5.3</version>
+        <version>4.5.9</version>
       </dependency>
       <dependency>
         <groupId>org.apache.httpcomponents</groupId>
         <artifactId>httpcore</artifactId>
-        <version>4.4.6</version>
+        <version>4.4.9</version>
       </dependency>
       <dependency>
         <groupId>org.apache.pinot</groupId>
@@ -361,7 +364,7 @@
       <dependency>
         <groupId>org.roaringbitmap</groupId>
         <artifactId>RoaringBitmap</artifactId>
-        <version>0.8.0</version>
+        <version>0.9.0</version>
       </dependency>
       <dependency>
         <groupId>com.101tec</groupId>
@@ -399,9 +402,14 @@
         <version>3.5</version>
       </dependency>
       <dependency>
+        <groupId>commons-collections</groupId>
+        <artifactId>commons-collections</artifactId>
+        <version>3.2.1</version>
+      </dependency>
+      <dependency>
         <groupId>commons-configuration</groupId>
         <artifactId>commons-configuration</artifactId>
-        <version>1.6</version>
+        <version>1.10</version>
       </dependency>
       <dependency>
         <groupId>commons-httpclient</groupId>
@@ -483,7 +491,7 @@
       <dependency>
         <groupId>org.apache.commons</groupId>
         <artifactId>commons-compress</artifactId>
-        <version>1.9</version>
+        <version>1.20</version>
       </dependency>
       <dependency>
         <groupId>org.apache.thrift</groupId>
@@ -702,6 +710,10 @@
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-log4j12</artifactId>
           </exclusion>
+          <exclusion>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+          </exclusion>
         </exclusions>
       </dependency>
       <dependency>
@@ -758,6 +770,10 @@
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-log4j12</artifactId>
           </exclusion>
+          <exclusion>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+          </exclusion>
         </exclusions>
       </dependency>
 
@@ -787,6 +803,10 @@
           <exclusion>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-log4j12</artifactId>
+          </exclusion>
+          <exclusion>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
           </exclusion>
         </exclusions>
       </dependency>
@@ -839,6 +859,12 @@
         <groupId>org.apache.orc</groupId>
         <artifactId>orc-core</artifactId>
         <version>1.5.9</version>
+        <exclusions>
+          <exclusion>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+          </exclusion>
+        </exclusions>
       </dependency>
       <dependency>
         <groupId>org.apache.avro</groupId>
@@ -869,7 +895,7 @@
       <dependency>
         <groupId>org.webjars</groupId>
         <artifactId>swagger-ui</artifactId>
-        <version>2.2.2</version>
+        <version>3.18.2</version>
       </dependency>
       <dependency>
         <groupId>com.clearspring.analytics</groupId>
@@ -1140,10 +1166,44 @@
         <artifactId>reflections</artifactId>
         <version>${reflections.version}</version>
       </dependency>
+      <!-- protobuf and grpc -->
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-java</artifactId>
+        <version>${protobuf.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.grpc</groupId>
+        <artifactId>grpc-netty-shaded</artifactId>
+        <version>${grpc.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.grpc</groupId>
+        <artifactId>grpc-protobuf</artifactId>
+        <version>${grpc.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.grpc</groupId>
+        <artifactId>grpc-stub</artifactId>
+        <version>${grpc.version}</version>
+      </dependency>
+      <!-- geo dependencies -->
+      <dependency>
+        <groupId>org.locationtech.jts</groupId>
+        <artifactId>jts-core</artifactId>
+        <version>${jts.version}</version>
+      </dependency>
     </dependencies>
   </dependencyManagement>
   <build>
     <defaultGoal>clean install</defaultGoal>
+    <extensions>
+      <extension>
+        <groupId>kr.motd.maven</groupId>
+        <artifactId>os-maven-plugin</artifactId>
+        <version>1.6.2</version>
+      </extension>
+    </extensions>
     <pluginManagement>
       <plugins>
         <plugin>
@@ -1315,6 +1375,26 @@
             <autoVersionSubmodules>true</autoVersionSubmodules>
           </configuration>
         </plugin>
+        <plugin>
+          <groupId>org.xolstice.maven.plugins</groupId>
+          <artifactId>protobuf-maven-plugin</artifactId>
+          <version>0.6.1</version>
+          <configuration>
+            <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+            <pluginId>grpc-java</pluginId>
+            <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+          </configuration>
+          <executions>
+            <execution>
+              <goals>
+                <goal>compile</goal>
+                <goal>compile-custom</goal>
+                <goal>test-compile</goal>
+                <goal>test-compile-custom</goal>
+              </goals>
+            </execution>
+          </executions>
+        </plugin>
       </plugins>
     </pluginManagement>
     <plugins>
@@ -1484,6 +1564,12 @@
             <exclude>**/normalize*</exclude>
             <exclude>**/handlebars*</exclude>
             <exclude>**/beautify*</exclude>
+            <exclude>**/node_modules/**</exclude>
+            <exclude>**/dist/**</exclude>
+            <exclude>**/.factorypath</exclude>
+            <exclude>**/app/**</exclude>
+            <exclude>**/src/main/resources/dist/**</exclude>
+            <exclude>**/src/main/resources/.*</exclude>
           </excludes>
           <mapping>
             <thrift>JAVADOC_STYLE</thrift>
@@ -1539,6 +1625,9 @@
             <exclude>**/normalize*</exclude>
             <exclude>**/handlebars*</exclude>
             <exclude>**/beautify*</exclude>
+            <exclude>**/src/main/resources/.*</exclude>
+            <exclude>**/src/main/resources/dist/**</exclude>
+            <exclude>**/src/main/resources/node_modules/**</exclude>
 
             <!-- Binary files -->
             <exclude>**/*.json</exclude>
@@ -1561,6 +1650,12 @@
             <!-- Test Resources -->
             <exclude>**/test/resources/**</exclude>
 
+            <!-- JDBC Drivers -->
+            <exclude>**/main/resources/java.sql.*</exclude>
+
+            <!-- Spark datasource register -->
+            <exclude>**/src/main/resources/META-INF/services/org.apache.spark.sql.sources.DataSourceRegister</exclude>
+
             <!-- Pinot Website (not part of the distribution) -->
             <exclude>website/**</exclude>
 
@@ -1574,6 +1669,9 @@
             <!-- Third eye (not part of the distribution) -->
             <exclude>thirdeye/**</exclude>
             <exclude>docker/images/pinot-thirdeye/**</exclude>
+
+            <!-- Github template files -->
+            <exclude>.github/*.md</exclude>
           </excludes>
         </configuration>
       </plugin>

@@ -33,6 +33,7 @@ import org.apache.pinot.thirdeye.datalayer.entity.AlertConfigIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.AlertSnapshotIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.AnomalyFeedbackIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.AnomalyFunctionIndex;
+import org.apache.pinot.thirdeye.datalayer.entity.AnomalySubscriptionGroupNotificationIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.ApplicationIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.ClassificationConfigIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.ConfigIndex;
@@ -50,9 +51,11 @@ import org.apache.pinot.thirdeye.datalayer.entity.JobIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.MergedAnomalyResultIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.MetricConfigIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.OnboardDatasetMetricIndex;
+import org.apache.pinot.thirdeye.datalayer.entity.OnlineDetectionDataIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.OverrideConfigIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.RawAnomalyResultIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.RootcauseSessionIndex;
+import org.apache.pinot.thirdeye.datalayer.entity.RootcauseTemplateIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.SessionIndex;
 import org.apache.pinot.thirdeye.datalayer.entity.TaskIndex;
 import org.apache.pinot.thirdeye.datalayer.pojo.AbstractBean;
@@ -60,6 +63,7 @@ import org.apache.pinot.thirdeye.datalayer.pojo.AlertConfigBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.AlertSnapshotBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.AnomalyFeedbackBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.AnomalyFunctionBean;
+import org.apache.pinot.thirdeye.datalayer.pojo.AnomalySubscriptionGroupNotificationBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.ApplicationBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.ClassificationConfigBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.ConfigBean;
@@ -76,9 +80,11 @@ import org.apache.pinot.thirdeye.datalayer.pojo.JobBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.MergedAnomalyResultBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.MetricConfigBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.OnboardDatasetMetricBean;
+import org.apache.pinot.thirdeye.datalayer.pojo.OnlineDetectionDataBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.OverrideConfigBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.RawAnomalyResultBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.RootcauseSessionBean;
+import org.apache.pinot.thirdeye.datalayer.pojo.RootcauseTemplateBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.SessionBean;
 import org.apache.pinot.thirdeye.datalayer.pojo.TaskBean;
 import org.apache.pinot.thirdeye.datalayer.util.GenericResultSetMapper;
@@ -163,6 +169,12 @@ public class GenericPojoDao {
         newPojoInfo(DEFAULT_BASE_TABLE_NAME, DetectionAlertConfigIndex.class));
     pojoInfoMap.put(EvaluationBean.class,
         newPojoInfo(DEFAULT_BASE_TABLE_NAME, EvaluationIndex.class));
+    pojoInfoMap.put(RootcauseTemplateBean.class,
+        newPojoInfo(DEFAULT_BASE_TABLE_NAME, RootcauseTemplateIndex.class));
+    pojoInfoMap.put(OnlineDetectionDataBean.class,
+        newPojoInfo(DEFAULT_BASE_TABLE_NAME, OnlineDetectionDataIndex.class));
+    pojoInfoMap.put(AnomalySubscriptionGroupNotificationBean.class,
+        newPojoInfo(DEFAULT_BASE_TABLE_NAME, AnomalySubscriptionGroupNotificationIndex.class));
   }
 
   private static PojoInfo newPojoInfo(String baseTableName,
@@ -375,7 +387,6 @@ public class GenericPojoDao {
     genericJsonEntity.setId(pojo.getId());
     genericJsonEntity.setVersion(pojo.getVersion());
     PojoInfo pojoInfo = pojoInfoMap.get(pojo.getClass());
-    dumpTable(connection, pojoInfo.indexEntityClass);
     Set<String> fieldsToUpdate = Sets.newHashSet("jsonVal", "updateTime", "version");
     int affectedRows;
     try (PreparedStatement baseTableInsertStmt =
@@ -598,7 +609,6 @@ public class GenericPojoDao {
         @Override
         public List<E> handle(Connection connection) throws Exception {
           PojoInfo pojoInfo = pojoInfoMap.get(pojoClass);
-          dumpTable(connection, pojoInfo.indexEntityClass);
           List<? extends AbstractIndexEntity> indexEntities;
           try (PreparedStatement findMatchingIdsStatement = sqlQueryBuilder.createStatementFromSQL(
               connection, parameterizedSQL, parameterMap, pojoInfo.indexEntityClass)) {
@@ -718,7 +728,6 @@ public class GenericPojoDao {
               idsToReturn.add(entity.getBaseId());
             }
           }
-          dumpTable(connection, pojoInfo.indexEntityClass);
           return idsToReturn;
         }
       }, Collections.<Long>emptyList());
@@ -728,6 +737,15 @@ public class GenericPojoDao {
     }
   }
 
+  /**
+   * Dump all entities of type entityClass to logger
+   * This utility is useful to dump the entire table. However, it gets executed in code regularly in debug mode.
+   *
+   * @param connection SQL connection
+   * @param entityClass The entity class.
+   * @throws Exception exceptions encountered during row fetches
+   */
+  @SuppressWarnings("unused")
   private void dumpTable(Connection connection, Class<? extends AbstractEntity> entityClass)
       throws Exception {
     long tStart = System.nanoTime();

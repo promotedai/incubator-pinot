@@ -24,6 +24,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.cache.LoadingCache;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
+import com.google.inject.Inject;
+import com.google.inject.Singleton;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -91,7 +93,6 @@ import org.apache.pinot.thirdeye.detection.DetectionPipelineLoader;
 import org.apache.pinot.thirdeye.detection.DetectionUtils;
 import org.apache.pinot.thirdeye.detection.cache.builder.AnomaliesCacheBuilder;
 import org.apache.pinot.thirdeye.detection.cache.builder.TimeSeriesCacheBuilder;
-import org.apache.pinot.thirdeye.detector.email.filter.AlertFilterFactory;
 import org.apache.pinot.thirdeye.detector.function.AnomalyFunctionFactory;
 import org.apache.pinot.thirdeye.detector.function.BaseAnomalyFunction;
 import org.apache.pinot.thirdeye.detector.metric.transfer.MetricTransfer;
@@ -108,11 +109,8 @@ import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import static org.apache.pinot.thirdeye.dataframe.util.DataFrameUtils.*;
-
-
-@Path(value = "/anomalies")
 @Produces(MediaType.APPLICATION_JSON)
+@Singleton
 public class AnomaliesResource {
   private static final String COL_CURRENT = "current";
   private static final String COL_BASELINE = "baseline";
@@ -149,6 +147,7 @@ public class AnomaliesResource {
   private final DetectionPipelineLoader loader;
   private final DataProvider provider;
 
+  @Inject
   public AnomaliesResource(AnomalyFunctionFactory anomalyFunctionFactory) {
     this.metricConfigDAO = DAO_REGISTRY.getMetricConfigDAO();
     this.mergedAnomalyResultDAO = DAO_REGISTRY.getMergedAnomalyResultDAO();
@@ -768,8 +767,8 @@ public class AnomaliesResource {
     // TODO type from agg function
     MetricSlice sliceAnomalyCurrent = MetricSlice.from(metric.getId(), anomaly.getStartTime(), anomaly.getEndTime(), filters);
 
-    details.setCurrent(makeStringValue(new DataFrame().addSeries(COL_VALUE, anomaly.getAvgCurrentVal())));
-    details.setBaseline(makeStringValue(new DataFrame().addSeries(COL_VALUE, anomaly.getAvgBaselineVal())));
+    details.setCurrent(makeStringValue(new DataFrame().addSeries(DataFrame.COL_VALUE, anomaly.getAvgCurrentVal())));
+    details.setBaseline(makeStringValue(new DataFrame().addSeries(DataFrame.COL_VALUE, anomaly.getAvgBaselineVal())));
 
     AnomalyOffset offsets = BaseAnomalyFunction.getDefaultOffsets(dataset);
 
@@ -782,14 +781,15 @@ public class AnomaliesResource {
     if (dfBaseline.contains(COL_CURRENT)) {
       // if baseline provider returns both current values and baseline values, using them as the result
       dfAligned = dfBaseline;
-      dfAligned.renameSeries(COL_VALUE, COL_BASELINE);
+      dfAligned.renameSeries(DataFrame.COL_VALUE, COL_BASELINE);
     } else {
       // otherwise fetch current values and join the time series to generate the result
       DataFrame dfCurrent = this.timeSeriesLoader.load(sliceViewCurrent);
-      dfAligned = dfCurrent.renameSeries(COL_VALUE, COL_CURRENT).joinOuter(dfBaseline.renameSeries(COL_VALUE, COL_BASELINE));
+      dfAligned = dfCurrent.renameSeries(DataFrame.COL_VALUE, COL_CURRENT).joinOuter(dfBaseline.renameSeries(
+          DataFrame.COL_VALUE, COL_BASELINE));
     }
 
-    details.setDates(makeStringDates(dfAligned.getLongs(COL_TIME)));
+    details.setDates(makeStringDates(dfAligned.getLongs(DataFrame.COL_TIME)));
     details.setCurrentValues(makeStringValues(dfAligned.getDoubles(COL_CURRENT)));
     details.setBaselineValues(makeStringValues(dfAligned.getDoubles(COL_BASELINE)));
 
@@ -804,13 +804,13 @@ public class AnomaliesResource {
     if (aggregate.isEmpty()) {
       return String.valueOf(Double.NaN);
     }
-    if (aggregate.get(COL_VALUE).isNull(0)) {
+    if (aggregate.get(DataFrame.COL_VALUE).isNull(0)) {
       return String.valueOf(Double.NaN);
     }
-    if (Double.isInfinite(aggregate.getDouble(COL_VALUE, 0))) {
+    if (Double.isInfinite(aggregate.getDouble(DataFrame.COL_VALUE, 0))) {
       return String.valueOf(Double.NaN);
     }
-    return formatDoubleValue(aggregate.getDouble(COL_VALUE, 0));
+    return formatDoubleValue(aggregate.getDouble(DataFrame.COL_VALUE, 0));
   }
 
   private static List<String> makeStringValues(DoubleSeries timeseries) {

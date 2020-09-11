@@ -27,10 +27,13 @@ import org.apache.pinot.thirdeye.anomaly.events.HolidayEventsLoader;
 import org.apache.pinot.thirdeye.anomaly.events.MockEventsLoader;
 import org.apache.pinot.thirdeye.anomaly.monitor.MonitorJobScheduler;
 import org.apache.pinot.thirdeye.anomaly.task.TaskDriver;
+import org.apache.pinot.thirdeye.common.restclient.ThirdEyeRestClientConfiguration;
 import org.apache.pinot.thirdeye.common.time.TimeGranularity;
 import org.apache.pinot.thirdeye.auto.onboard.AutoOnboardService;
 import org.apache.pinot.thirdeye.common.BaseThirdEyeApplication;
 import org.apache.pinot.thirdeye.common.ThirdEyeSwaggerBundle;
+import org.apache.pinot.thirdeye.common.utils.SessionUtils;
+import org.apache.pinot.thirdeye.datalayer.dto.SessionDTO;
 import org.apache.pinot.thirdeye.datasource.DAORegistry;
 import org.apache.pinot.thirdeye.datasource.ThirdEyeCacheRegistry;
 import org.apache.pinot.thirdeye.datasource.pinot.resources.PinotDataSourceResource;
@@ -94,7 +97,7 @@ public class ThirdEyeAnomalyApplication
   }
 
   @Override
-  public void run(final ThirdEyeAnomalyConfiguration config, final Environment environment)
+  public void run(final ThirdEyeAnomalyConfiguration config, final Environment env)
       throws Exception {
     LOG.info("Starting ThirdeyeAnomalyApplication : Scheduler {} Worker {}", config.isScheduler(), config.isWorker());
     super.initDAOs();
@@ -104,10 +107,14 @@ public class ThirdEyeAnomalyApplication
       LOG.error("Exception while loading caches", e);
     }
 
-    environment.getObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
-    environment.getObjectMapper().registerModule(makeMapperModule());
+    env.getObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
+    env.getObjectMapper().registerModule(makeMapperModule());
 
-    environment.lifecycle().manage(new Managed() {
+    env.lifecycle().manage(lifecycleManager(config, env));
+  }
+
+  private Managed lifecycleManager(ThirdEyeAnomalyConfiguration config, Environment env) {
+    return new Managed() {
       @Override
       public void start() throws Exception {
 
@@ -115,9 +122,15 @@ public class ThirdEyeAnomalyApplication
         requestStatisticsLogger.start();
 
         if (config.isWorker()) {
-          taskDriver = new TaskDriver(config);
+          taskDriver = new TaskDriver(config, false);
           taskDriver.start();
         }
+
+        if (config.isOnlineWorker()) {
+          taskDriver = new TaskDriver(config, true);
+          taskDriver.start();
+        }
+
         if (config.isMonitor()) {
           monitorJobScheduler = new MonitorJobScheduler(config.getMonitorConfiguration());
           monitorJobScheduler.start();
@@ -131,14 +144,14 @@ public class ThirdEyeAnomalyApplication
               new HolidayEventsLoader(config.getHolidayEventsLoaderConfiguration(), config.getCalendarApiKeyPath(),
                   DAORegistry.getInstance().getEventDAO());
           holidayEventsLoader.start();
-          environment.jersey().register(new HolidayEventResource(holidayEventsLoader));
+          env.jersey().register(new HolidayEventResource(holidayEventsLoader));
         }
         if (config.isMockEventsLoader()) {
           mockEventsLoader = new MockEventsLoader(config.getMockEventsLoaderConfiguration(), DAORegistry.getInstance().getEventDAO());
           mockEventsLoader.run();
         }
         if (config.isPinotProxy()) {
-          environment.jersey().register(new PinotDataSourceResource());
+          env.jersey().register(new PinotDataSourceResource());
         }
         if (config.isDetectionPipeline()) {
           detectionScheduler = new DetectionCronScheduler(DAORegistry.getInstance().getDetectionConfigManager());
@@ -163,6 +176,10 @@ public class ThirdEyeAnomalyApplication
         if (config.getModelDownloaderConfig() != null) {
           modelDownloaderManager = new ModelDownloaderManager(config.getModelDownloaderConfig());
           modelDownloaderManager.start();
+        }
+        if (config.getThirdEyeRestClientConfiguration() != null) {
+          ThirdEyeRestClientConfiguration restClientConfig = config.getThirdEyeRestClientConfiguration();
+          updateAdminSession(restClientConfig.getAdminUser(), restClientConfig.getSessionKey());
         }
       }
 
@@ -193,6 +210,18 @@ public class ThirdEyeAnomalyApplication
           modelDownloaderManager.shutdown();
         }
       }
-    });
+    };
+  }
+
+  private void updateAdminSession(String adminUser, String sessionKey) {
+    SessionDTO savedSession = DAO_REGISTRY.getSessionDAO().findBySessionKey(sessionKey);
+    long expiryMillis = System.currentTimeMillis() + TimeUnit.DAYS.toMillis(365);
+    if (savedSession == null) {
+      SessionDTO sessionDTO = SessionUtils.buildServiceAccount(adminUser, sessionKey, expiryMillis);
+      DAO_REGISTRY.getSessionDAO().save(sessionDTO);
+    } else {
+      savedSession.setExpirationTime(expiryMillis);
+      DAO_REGISTRY.getSessionDAO().update(savedSession);
+    }
   }
 }

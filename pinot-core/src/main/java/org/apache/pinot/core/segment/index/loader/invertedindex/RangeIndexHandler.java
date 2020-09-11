@@ -24,16 +24,17 @@ import java.util.HashSet;
 import java.util.Set;
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.core.indexsegment.generator.SegmentVersion;
-import org.apache.pinot.core.io.reader.DataFileReader;
-import org.apache.pinot.core.io.reader.SingleColumnMultiValueReader;
-import org.apache.pinot.core.io.reader.impl.v1.FixedBitMultiValueReader;
-import org.apache.pinot.core.io.reader.impl.v1.FixedBitSingleValueReader;
 import org.apache.pinot.core.segment.creator.impl.V1Constants;
 import org.apache.pinot.core.segment.creator.impl.inv.RangeIndexCreator;
 import org.apache.pinot.core.segment.index.loader.IndexLoadingConfig;
 import org.apache.pinot.core.segment.index.loader.LoaderUtils;
 import org.apache.pinot.core.segment.index.metadata.ColumnMetadata;
 import org.apache.pinot.core.segment.index.metadata.SegmentMetadataImpl;
+import org.apache.pinot.core.segment.index.readers.ForwardIndexReader;
+import org.apache.pinot.core.segment.index.readers.ForwardIndexReaderContext;
+import org.apache.pinot.core.segment.index.readers.forward.FixedBitMVForwardIndexReader;
+import org.apache.pinot.core.segment.index.readers.forward.FixedBitSVForwardIndexReader;
+import org.apache.pinot.core.segment.index.readers.forward.FixedByteChunkSVForwardIndexReader;
 import org.apache.pinot.core.segment.memory.PinotDataBuffer;
 import org.apache.pinot.core.segment.store.ColumnIndexType;
 import org.apache.pinot.core.segment.store.SegmentDirectory;
@@ -42,6 +43,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
+@SuppressWarnings({"rawtypes", "unchecked"})
 public class RangeIndexHandler {
   private static final Logger LOGGER = LoggerFactory.getLogger(RangeIndexHandler.class);
 
@@ -61,7 +63,7 @@ public class RangeIndexHandler {
     // Only create range index on dictionary-encoded unsorted columns
     for (String column : indexLoadingConfig.getRangeIndexColumns()) {
       ColumnMetadata columnMetadata = segmentMetadata.getColumnMetadataFor(column);
-      if (columnMetadata != null && !columnMetadata.isSorted() && columnMetadata.hasDictionary()) {
+      if (columnMetadata != null && !columnMetadata.isSorted()) {
         _rangeIndexColumns.add(columnMetadata);
       }
     }
@@ -101,7 +103,11 @@ public class RangeIndexHandler {
 
     // Create new range index for the column.
     LOGGER.info("Creating new range index for segment: {}, column: {}", _segmentName, column);
-    handleDictionaryBasedColumn(columnMetadata);
+    if (columnMetadata.hasDictionary()) {
+      handleDictionaryBasedColumn(columnMetadata);
+    } else {
+      handleNonDictionaryBasedColumn(columnMetadata);
+    }
 
     // For v3, write the generated range index file into the single file and remove it.
     if (_segmentVersion == SegmentVersion.v3) {
@@ -117,38 +123,119 @@ public class RangeIndexHandler {
   private void handleDictionaryBasedColumn(ColumnMetadata columnMetadata)
       throws IOException {
     int numDocs = columnMetadata.getTotalDocs();
-    try (RangeIndexCreator creator = new RangeIndexCreator(_indexDir, columnMetadata.getFieldSpec(),
-        FieldSpec.DataType.INT, -1, -1, numDocs, columnMetadata.getTotalNumberOfEntries())) {
-      try (DataFileReader fwdIndex = getForwardIndexReader(columnMetadata, _segmentWriter)) {
-        if (columnMetadata.isSingleValue()) {
-          // Single-value column.
-          FixedBitSingleValueReader svFwdIndex = (FixedBitSingleValueReader) fwdIndex;
-          for (int i = 0; i < numDocs; i++) {
-            creator.add(svFwdIndex.getInt(i));
-          }
-        } else {
-          // Multi-value column.
-          SingleColumnMultiValueReader mvFwdIndex = (SingleColumnMultiValueReader) fwdIndex;
-          int[] dictIds = new int[columnMetadata.getMaxNumberOfMultiValues()];
-          for (int i = 0; i < numDocs; i++) {
-            int length = mvFwdIndex.getIntArray(i, dictIds);
-            creator.add(dictIds, length);
-          }
+    try (ForwardIndexReader forwardIndexReader = getForwardIndexReader(columnMetadata, _segmentWriter);
+        ForwardIndexReaderContext readerContext = forwardIndexReader.createContext();
+        RangeIndexCreator rangeIndexCreator = new RangeIndexCreator(_indexDir, columnMetadata.getFieldSpec(),
+            FieldSpec.DataType.INT, -1, -1, numDocs, columnMetadata.getTotalNumberOfEntries())) {
+      if (columnMetadata.isSingleValue()) {
+        // Single-value column
+        for (int i = 0; i < numDocs; i++) {
+          rangeIndexCreator.add(forwardIndexReader.getDictId(i, readerContext));
         }
-        creator.seal();
+      } else {
+        // Multi-value column
+        int[] dictIds = new int[columnMetadata.getMaxNumberOfMultiValues()];
+        for (int i = 0; i < numDocs; i++) {
+          int length = forwardIndexReader.getDictIdMV(i, dictIds, readerContext);
+          rangeIndexCreator.add(dictIds, length);
+        }
       }
+      rangeIndexCreator.seal();
     }
   }
 
-  private DataFileReader getForwardIndexReader(ColumnMetadata columnMetadata, SegmentDirectory.Writer segmentWriter)
+  private void handleNonDictionaryBasedColumn(ColumnMetadata columnMetadata)
+      throws IOException {
+    int numDocs = columnMetadata.getTotalDocs();
+    try (ForwardIndexReader forwardIndexReader = getForwardIndexReader(columnMetadata, _segmentWriter);
+        ForwardIndexReaderContext readerContext = forwardIndexReader.createContext();
+        RangeIndexCreator rangeIndexCreator = new RangeIndexCreator(_indexDir, columnMetadata.getFieldSpec(),
+            columnMetadata.getDataType(), -1, -1, numDocs, columnMetadata.getTotalNumberOfEntries())) {
+      if (columnMetadata.isSingleValue()) {
+        // Single-value column.
+        switch (columnMetadata.getDataType()) {
+          case INT:
+            for (int i = 0; i < numDocs; i++) {
+              rangeIndexCreator.add(forwardIndexReader.getInt(i, readerContext));
+            }
+            break;
+          case LONG:
+            for (int i = 0; i < numDocs; i++) {
+              rangeIndexCreator.add(forwardIndexReader.getLong(i, readerContext));
+            }
+            break;
+          case FLOAT:
+            for (int i = 0; i < numDocs; i++) {
+              rangeIndexCreator.add(forwardIndexReader.getFloat(i, readerContext));
+            }
+            break;
+          case DOUBLE:
+            for (int i = 0; i < numDocs; i++) {
+              rangeIndexCreator.add(forwardIndexReader.getDouble(i, readerContext));
+            }
+            break;
+          default:
+            throw new IllegalStateException("Unsupported data type: " + columnMetadata.getDataType());
+        }
+      } else {
+        // Multi-value column
+        int maxNumValuesPerMVEntry = columnMetadata.getMaxNumberOfMultiValues();
+        switch (columnMetadata.getDataType()) {
+          case INT:
+            int[] intValues = new int[maxNumValuesPerMVEntry];
+            for (int i = 0; i < numDocs; i++) {
+              int length = forwardIndexReader.getIntMV(i, intValues, readerContext);
+              rangeIndexCreator.add(intValues, length);
+            }
+            break;
+          case LONG:
+            long[] longValues = new long[maxNumValuesPerMVEntry];
+            for (int i = 0; i < numDocs; i++) {
+              int length = forwardIndexReader.getLongMV(i, longValues, readerContext);
+              rangeIndexCreator.add(longValues, length);
+            }
+            break;
+          case FLOAT:
+            float[] floatValues = new float[maxNumValuesPerMVEntry];
+            for (int i = 0; i < numDocs; i++) {
+              int length = forwardIndexReader.getFloatMV(i, floatValues, readerContext);
+              rangeIndexCreator.add(floatValues, length);
+            }
+            break;
+          case DOUBLE:
+            double[] doubleValues = new double[maxNumValuesPerMVEntry];
+            for (int i = 0; i < numDocs; i++) {
+              int length = forwardIndexReader.getDoubleMV(i, doubleValues, readerContext);
+              rangeIndexCreator.add(doubleValues, length);
+            }
+            break;
+          default:
+            throw new IllegalStateException("Unsupported data type: " + columnMetadata.getDataType());
+        }
+      }
+      rangeIndexCreator.seal();
+    }
+  }
+
+  private ForwardIndexReader<?> getForwardIndexReader(ColumnMetadata columnMetadata,
+      SegmentDirectory.Writer segmentWriter)
       throws IOException {
     PinotDataBuffer buffer = segmentWriter.getIndexFor(columnMetadata.getColumnName(), ColumnIndexType.FORWARD_INDEX);
     int numRows = columnMetadata.getTotalDocs();
     int numBitsPerValue = columnMetadata.getBitsPerElement();
     if (columnMetadata.isSingleValue()) {
-      return new FixedBitSingleValueReader(buffer, numRows, numBitsPerValue);
+      if (columnMetadata.hasDictionary()) {
+        return new FixedBitSVForwardIndexReader(buffer, numRows, numBitsPerValue);
+      } else {
+        return new FixedByteChunkSVForwardIndexReader(buffer, columnMetadata.getDataType());
+      }
     } else {
-      return new FixedBitMultiValueReader(buffer, numRows, columnMetadata.getTotalNumberOfEntries(), numBitsPerValue);
+      if (columnMetadata.hasDictionary()) {
+        return new FixedBitMVForwardIndexReader(buffer, numRows, columnMetadata.getTotalNumberOfEntries(),
+            numBitsPerValue);
+      } else {
+        throw new IllegalStateException("Raw index on multi-value column is not supported");
+      }
     }
   }
 }

@@ -26,7 +26,7 @@
   <parent>
     <artifactId>pinot</artifactId>
     <groupId>org.apache.pinot</groupId>
-    <version>${revision}${sha1}</version>
+    <version>0.5.0-SNAPSHOT</version>
     <relativePath>..</relativePath>
   </parent>
   <artifactId>pinot-clients</artifactId>
@@ -39,6 +39,7 @@
 
   <modules>
     <module>pinot-java-client</module>
+    <module>pinot-jdbc-client</module>
   </modules>
 
   <dependencies>

@@ -23,13 +23,14 @@ import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.core.data.readers.PinotSegmentRecordReader;
 import org.apache.pinot.core.data.recordtransformer.CompositeTransformer;
@@ -38,8 +39,6 @@ import org.apache.pinot.core.indexsegment.generator.SegmentGeneratorConfig;
 import org.apache.pinot.core.indexsegment.generator.SegmentVersion;
 import org.apache.pinot.core.segment.creator.ColumnIndexCreationInfo;
 import org.apache.pinot.core.segment.creator.ColumnStatistics;
-import org.apache.pinot.core.segment.creator.ForwardIndexType;
-import org.apache.pinot.core.segment.creator.InvertedIndexType;
 import org.apache.pinot.core.segment.creator.RecordReaderSegmentCreationDataSource;
 import org.apache.pinot.core.segment.creator.SegmentCreationDataSource;
 import org.apache.pinot.core.segment.creator.SegmentCreator;
@@ -51,16 +50,19 @@ import org.apache.pinot.core.segment.index.converter.SegmentFormatConverter;
 import org.apache.pinot.core.segment.index.converter.SegmentFormatConverterFactory;
 import org.apache.pinot.core.segment.store.SegmentDirectoryPaths;
 import org.apache.pinot.core.startree.v2.builder.MultipleTreesBuilder;
-import org.apache.pinot.core.startree.v2.builder.StarTreeV2BuilderConfig;
 import org.apache.pinot.core.util.CrcUtils;
 import org.apache.pinot.core.util.IngestionUtils;
+import org.apache.pinot.spi.config.table.StarTreeIndexConfig;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.data.FieldSpec;
 import org.apache.pinot.spi.data.Schema;
+import org.apache.pinot.spi.data.IngestionSchemaValidator;
+import org.apache.pinot.spi.data.SchemaValidatorFactory;
 import org.apache.pinot.spi.data.readers.FileFormat;
 import org.apache.pinot.spi.data.readers.GenericRow;
 import org.apache.pinot.spi.data.readers.RecordReader;
 import org.apache.pinot.spi.data.readers.RecordReaderFactory;
+import org.apache.pinot.spi.utils.ByteArray;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -80,6 +82,7 @@ public class SegmentIndexCreationDriverImpl implements SegmentIndexCreationDrive
   private SegmentIndexCreationInfo segmentIndexCreationInfo;
   private Schema dataSchema;
   private RecordTransformer _recordTransformer;
+  private IngestionSchemaValidator _ingestionSchemaValidator;
   private int totalDocs = 0;
   private File tempIndexDir;
   private String segmentName;
@@ -127,13 +130,19 @@ public class SegmentIndexCreationDriverImpl implements SegmentIndexCreationDrive
     }
   }
 
-  public void init(SegmentGeneratorConfig config, RecordReader recordReader) {
+  public RecordReader getRecordReader() {
+    return recordReader;
+  }
+
+  public void init(SegmentGeneratorConfig config, RecordReader recordReader)
+      throws Exception {
     init(config, new RecordReaderSegmentCreationDataSource(recordReader),
         CompositeTransformer.getDefaultTransformer(config.getTableConfig(), config.getSchema()));
   }
 
   public void init(SegmentGeneratorConfig config, SegmentCreationDataSource dataSource,
-      RecordTransformer recordTransformer) {
+      RecordTransformer recordTransformer)
+      throws Exception {
     this.config = config;
     recordReader = dataSource.getRecordReader();
     Preconditions.checkState(recordReader.hasNext(), "No record in data source");
@@ -159,8 +168,11 @@ public class SegmentIndexCreationDriverImpl implements SegmentIndexCreationDrive
       indexDir.mkdirs();
     }
 
+    _ingestionSchemaValidator = SchemaValidatorFactory.getSchemaValidator(dataSchema, recordReader.getClass().getName(),
+        config.getInputFilePath());
+
     // Create a temporary directory used in segment creation
-    tempIndexDir = new File(indexDir, org.apache.pinot.common.utils.FileUtils.getRandomFileName());
+    tempIndexDir = new File(indexDir, "tmp-" + UUID.randomUUID());
     LOGGER.debug("tempIndexDir:{}", tempIndexDir);
   }
 
@@ -287,18 +299,16 @@ public class SegmentIndexCreationDriverImpl implements SegmentIndexCreationDrive
 
   private void buildStarTreeV2IfNecessary(File indexDir)
       throws Exception {
-    List<StarTreeV2BuilderConfig> starTreeV2BuilderConfigs = new ArrayList<>();
-    if (config.getStarTreeV2BuilderConfigs() != null) {
-      starTreeV2BuilderConfigs.addAll(config.getStarTreeV2BuilderConfigs());
-    }
-    // Append the default star-tree after the customized star-trees if enabled
-    if (config.isEnableDefaultStarTree()) {
-      starTreeV2BuilderConfigs.add(null);
-    }
-    if (!starTreeV2BuilderConfigs.isEmpty()) {
+    List<StarTreeIndexConfig> starTreeIndexConfigs = config.getStarTreeIndexConfigs();
+    boolean enableDefaultStarTree = config.isEnableDefaultStarTree();
+    if (CollectionUtils.isNotEmpty(starTreeIndexConfigs) || enableDefaultStarTree) {
       MultipleTreesBuilder.BuildMode buildMode =
           config.isOnHeap() ? MultipleTreesBuilder.BuildMode.ON_HEAP : MultipleTreesBuilder.BuildMode.OFF_HEAP;
-      new MultipleTreesBuilder(starTreeV2BuilderConfigs, indexDir, buildMode).build();
+      try (
+          MultipleTreesBuilder builder = new MultipleTreesBuilder(starTreeIndexConfigs, enableDefaultStarTree, indexDir,
+              buildMode)) {
+        builder.build();
+      }
     }
   }
 
@@ -347,6 +357,7 @@ public class SegmentIndexCreationDriverImpl implements SegmentIndexCreationDrive
    */
   void buildIndexCreationInfo()
       throws Exception {
+    Set<String> varLengthDictionaryColumns = new HashSet<>(config.getVarLengthDictionaryColumns());
     for (FieldSpec fieldSpec : dataSchema.getAllFieldSpecs()) {
       // Ignore virtual columns
       if (fieldSpec.isVirtualColumn()) {
@@ -355,11 +366,12 @@ public class SegmentIndexCreationDriverImpl implements SegmentIndexCreationDrive
 
       String columnName = fieldSpec.getName();
       ColumnStatistics columnProfile = segmentStats.getColumnProfileFor(columnName);
-      Set<String> varLengthDictionaryColumns = new HashSet<>(config.getVarLengthDictionaryColumns());
+      Object defaultNullValue = fieldSpec.getDefaultNullValue();
+      if (fieldSpec.getDataType() == FieldSpec.DataType.BYTES) {
+        defaultNullValue = new ByteArray((byte[]) defaultNullValue);
+      }
       indexCreationInfoMap.put(columnName, new ColumnIndexCreationInfo(columnProfile, true/*createDictionary*/,
-          varLengthDictionaryColumns.contains(columnName), ForwardIndexType.FIXED_BIT_COMPRESSED,
-          InvertedIndexType.ROARING_BITMAPS, false/*isAutoGenerated*/,
-          dataSchema.getFieldSpecFor(columnName).getDefaultNullValue()));
+          varLengthDictionaryColumns.contains(columnName), false/*isAutoGenerated*/, defaultNullValue));
     }
     segmentIndexCreationInfo.setTotalDocs(totalDocs);
   }
@@ -378,6 +390,14 @@ public class SegmentIndexCreationDriverImpl implements SegmentIndexCreationDrive
   @Override
   public File getOutputDirectory() {
     return new File(new File(config.getOutDir()), segmentName);
+  }
+
+  /**
+   * Returns the schema validator.
+   */
+  @Override
+  public IngestionSchemaValidator getIngestionSchemaValidator() {
+    return _ingestionSchemaValidator;
   }
 
   public SegmentPreIndexStatsContainer getSegmentStats() {

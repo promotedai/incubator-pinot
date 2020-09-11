@@ -18,54 +18,51 @@
  */
 package org.apache.pinot.plugin.filesystem;
 
-import com.google.common.collect.ImmutableList;
-import org.apache.commons.configuration.Configuration;
-import org.apache.pinot.spi.filesystem.PinotFS;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain;
-import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.SystemPropertyCredentialsProvider;
-import software.amazon.awssdk.core.ResponseBytes;
-import software.amazon.awssdk.core.sync.RequestBody;
-import software.amazon.awssdk.core.sync.ResponseTransformer;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.s3.S3Client;
-
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
-import java.io.IOException;
-import java.io.File;
-import java.io.UnsupportedEncodingException;
-import java.io.InputStream;
 
-import software.amazon.awssdk.services.s3.model.S3Exception;
-import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
-import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
-import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
-import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import org.apache.commons.io.FileUtils;
+import org.apache.pinot.spi.env.PinotConfiguration;
+import org.apache.pinot.spi.filesystem.PinotFS;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.core.sync.ResponseTransformer;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectResponse;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.MetadataDirective;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
-import software.amazon.awssdk.services.s3.model.MetadataDirective;
-
-import com.google.common.base.Preconditions;
 
 
 public class S3PinotFS extends PinotFS {
@@ -75,25 +72,24 @@ public class S3PinotFS extends PinotFS {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(S3PinotFS.class);
   private static final String DELIMITER = "/";
+  public static final String S3_SCHEME = "s3://";
   private S3Client _s3Client;
 
   @Override
-  public void init(Configuration config) {
-    Preconditions.checkArgument(!isNullOrEmpty(config.getString(REGION)));
-    String region = config.getString(REGION);
+  public void init(PinotConfiguration config) {
+    Preconditions.checkArgument(!isNullOrEmpty(config.getProperty(REGION)));
+    String region = config.getProperty(REGION);
 
     AwsCredentialsProvider awsCredentialsProvider;
     try {
 
-      if (!isNullOrEmpty(config.getString(ACCESS_KEY)) && !isNullOrEmpty(config.getString(SECRET_KEY))) {
-        String accessKey = config.getString(ACCESS_KEY);
-        String secretKey = config.getString(SECRET_KEY);
+      if (!isNullOrEmpty(config.getProperty(ACCESS_KEY)) && !isNullOrEmpty(config.getProperty(SECRET_KEY))) {
+        String accessKey = config.getProperty(ACCESS_KEY);
+        String secretKey = config.getProperty(SECRET_KEY);
         AwsBasicCredentials awsBasicCredentials = AwsBasicCredentials.create(accessKey, secretKey);
         awsCredentialsProvider = StaticCredentialsProvider.create(awsBasicCredentials);
       } else {
-        awsCredentialsProvider =
-            AwsCredentialsProviderChain.builder().addCredentialsProvider(SystemPropertyCredentialsProvider.create())
-                .addCredentialsProvider(EnvironmentVariableCredentialsProvider.create()).build();
+        awsCredentialsProvider = DefaultCredentialsProvider.create();
       }
 
       _s3Client = S3Client.builder().region(Region.of(region)).credentialsProvider(awsCredentialsProvider).build();
@@ -326,8 +322,9 @@ public class S3PinotFS extends PinotFS {
     Path srcPath = Paths.get(srcUri.getPath());
     try {
       boolean copySucceeded = true;
-      for (String directoryEntry : listFiles(srcUri, true)) {
-        String directoryEntryPrefix = DELIMITER + directoryEntry;
+      for (String filePath : listFiles(srcUri, true)) {
+        URI srcFileURI = URI.create(filePath);
+        String directoryEntryPrefix =  srcFileURI.getPath();
         URI src = new URI(srcUri.getScheme(), srcUri.getHost(), directoryEntryPrefix, null);
         String relativeSrcPath = srcPath.relativize(Paths.get(directoryEntryPrefix)).toString();
         String dstPath = dstUri.resolve(relativeSrcPath).getPath();
@@ -397,7 +394,11 @@ public class S3PinotFS extends PinotFS {
       listObjectsV2Response.contents().stream().forEach(object -> {
         //Only add files and not directories
         if (!object.key().equals(fileUri.getPath()) && !object.key().endsWith(DELIMITER)) {
-          builder.add(object.key());
+          String fileKey = object.key();
+          if (fileKey.startsWith(DELIMITER)) {
+            fileKey = fileKey.substring(1);
+          }
+          builder.add(S3_SCHEME + fileUri.getHost() + DELIMITER + fileKey);
         }
       });
       return builder.build().toArray(new String[0]);
@@ -411,6 +412,7 @@ public class S3PinotFS extends PinotFS {
       throws Exception {
     LOGGER.info("Copy {} to local {}", srcUri, dstFile.getAbsolutePath());
     URI base = getBase(srcUri);
+    FileUtils.forceMkdir(dstFile.getParentFile());
     String prefix = sanitizePath(base.relativize(srcUri).getPath());
     GetObjectRequest getObjectRequest = GetObjectRequest.builder().bucket(srcUri.getHost()).key(prefix).build();
 
@@ -436,18 +438,10 @@ public class S3PinotFS extends PinotFS {
       if (prefix.equals(DELIMITER)) {
         return true;
       }
-      try {
-        HeadObjectRequest headObjectRequest =
-            HeadObjectRequest.builder().bucket(uri.getHost()).key(uri.getPath()).build();
-        HeadObjectResponse s3ObjectMetadata = _s3Client.headObject(headObjectRequest);
 
-        return s3ObjectMetadata.sdkHttpResponse().isSuccessful();
-      } catch (NoSuchKeyException e) {
-        LOGGER.error("Could not get directory entry for {}", uri);
-      }
-
-      ListObjectsV2Request listObjectsV2Request =
-          ListObjectsV2Request.builder().bucket(uri.getHost()).prefix(prefix).build();
+      ListObjectsV2Request listObjectsV2Request = ListObjectsV2Request
+              .builder().bucket(uri.getHost())
+              .prefix(prefix).maxKeys(2).build();
       ListObjectsV2Response listObjectsV2Response = _s3Client.listObjectsV2(listObjectsV2Request);
       return listObjectsV2Response.hasContents();
     } catch (NoSuchKeyException e) {
@@ -501,8 +495,7 @@ public class S3PinotFS extends PinotFS {
       String path = sanitizePath(uri.getPath());
       GetObjectRequest getObjectRequest = GetObjectRequest.builder().bucket(uri.getHost()).key(path).build();
 
-      ResponseBytes responseBytes = _s3Client.getObjectAsBytes(getObjectRequest);
-      return responseBytes.asInputStream();
+      return _s3Client.getObjectAsBytes(getObjectRequest).asInputStream();
     } catch (S3Exception e) {
       throw e;
     }
@@ -513,4 +506,5 @@ public class S3PinotFS extends PinotFS {
       throws IOException {
     super.close();
   }
+
 }

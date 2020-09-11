@@ -19,7 +19,9 @@
 package org.apache.pinot.tools.segment.converter;
 
 import java.io.File;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Map;
 import org.apache.avro.Schema;
 import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericData.Record;
@@ -54,11 +56,13 @@ public class PinotSegmentToAvroConverter implements PinotSegmentConverter {
         while (pinotSegmentRecordReader.hasNext()) {
           row = pinotSegmentRecordReader.next(row);
           Record record = new Record(avroSchema);
-
-          for (String field : row.getFieldNames()) {
-            Object value = row.getValue(field);
+          for (Map.Entry<String, Object> entry : row.getFieldToValueMap().entrySet()) {
+            String field = entry.getKey();
+            Object value = entry.getValue();
             if (value instanceof Object[]) {
               record.put(field, Arrays.asList((Object[]) value));
+            } else if (value instanceof byte[]) {
+              record.put(field, ByteBuffer.wrap((byte[]) value));
             } else {
               record.put(field, value);
             }

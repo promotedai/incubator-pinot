@@ -18,22 +18,33 @@
  */
 package org.apache.pinot.plugin.ingestion.batch.spark;
 
+import static org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationTaskRunner.LOCAL_DIRECTORY_SEQUENCE_ID;
+import static org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationUtils.PINOT_PLUGINS_DIR;
+import static org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationUtils.PINOT_PLUGINS_TAR_GZ;
+import static org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationUtils.getFileName;
+import static org.apache.pinot.spi.plugin.PluginManager.PLUGINS_DIR_PROPERTY_NAME;
+import static org.apache.pinot.spi.plugin.PluginManager.PLUGINS_INCLUDE_PROPERTY_NAME;
+
 import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
 import java.net.URI;
 import java.nio.file.FileSystems;
+import java.nio.file.Path;
 import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
-import org.apache.commons.configuration.Configuration;
-import org.apache.commons.configuration.MapConfiguration;
+import java.util.Map;
+import java.util.UUID;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.common.utils.TarGzCompressionUtils;
 import org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationTaskRunner;
 import org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationUtils;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.filesystem.PinotFS;
 import org.apache.pinot.spi.filesystem.PinotFSFactory;
 import org.apache.pinot.spi.ingestion.batch.runner.IngestionJobRunner;
@@ -47,14 +58,9 @@ import org.apache.pinot.spi.utils.DataSizeUtils;
 import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.VoidFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import static org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationUtils.PINOT_PLUGINS_DIR;
-import static org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationUtils.PINOT_PLUGINS_TAR_GZ;
-import static org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationUtils.getFileName;
-import static org.apache.pinot.spi.plugin.PluginManager.PLUGINS_DIR_PROPERTY_NAME;
-import static org.apache.pinot.spi.plugin.PluginManager.PLUGINS_INCLUDE_PROPERTY_NAME;
 
 
 public class SparkSegmentGenerationJobRunner implements IngestionJobRunner, Serializable {
@@ -119,8 +125,7 @@ public class SparkSegmentGenerationJobRunner implements IngestionJobRunner, Seri
     //init all file systems
     List<PinotFSSpec> pinotFSSpecs = _spec.getPinotFSSpecs();
     for (PinotFSSpec pinotFSSpec : pinotFSSpecs) {
-      Configuration config = new MapConfiguration(pinotFSSpec.getConfigs());
-      PinotFSFactory.register(pinotFSSpec.getScheme(), pinotFSSpec.getClassName(), config);
+      PinotFSFactory.register(pinotFSSpec.getScheme(), pinotFSSpec.getClassName(), new PinotConfiguration(pinotFSSpec));
     }
 
     //Get pinotFS for input
@@ -199,8 +204,31 @@ public class SparkSegmentGenerationJobRunner implements IngestionJobRunner, Seri
       }
 
       List<String> pathAndIdxList = new ArrayList<>();
-      for (int i = 0; i < filteredFiles.size(); i++) {
-        pathAndIdxList.add(String.format("%s %d", filteredFiles.get(i), i));
+      String localDirectorySequenceIdString = _spec.getSegmentNameGeneratorSpec().getConfigs().get(LOCAL_DIRECTORY_SEQUENCE_ID);
+      boolean localDirectorySequenceId = false;
+      if (localDirectorySequenceIdString != null) {
+        localDirectorySequenceId = Boolean.parseBoolean(localDirectorySequenceIdString);
+      }
+      if (localDirectorySequenceId) {
+        Map<String, List<String>> localDirIndex = new HashMap<>();
+        for (String filteredFile : filteredFiles) {
+          Path filteredParentPath = Paths.get(filteredFile).getParent();
+          if (!localDirIndex.containsKey(filteredParentPath.toString())) {
+            localDirIndex.put(filteredParentPath.toString(), new ArrayList<>());
+          }
+          localDirIndex.get(filteredParentPath.toString()).add(filteredFile);
+        }
+        for (String parentPath: localDirIndex.keySet()){
+          List<String> siblingFiles = localDirIndex.get(parentPath);
+          Collections.sort(siblingFiles);
+          for (int i = 0; i < siblingFiles.size(); i++) {
+            pathAndIdxList.add(String.format("%s %d", siblingFiles.get(i), i));
+          }
+        }
+      } else {
+        for (int i = 0; i < filteredFiles.size(); i++) {
+          pathAndIdxList.add(String.format("%s %d", filteredFiles.get(i), i));
+        }
       }
       JavaRDD<String> pathRDD = sparkContext.parallelize(pathAndIdxList, pathAndIdxList.size());
 
@@ -209,94 +237,100 @@ public class SparkSegmentGenerationJobRunner implements IngestionJobRunner, Seri
               .get(PLUGINS_INCLUDE_PROPERTY_NAME) : null;
       final URI finalInputDirURI = inputDirURI;
       final URI finalOutputDirURI = (stagingDirURI == null) ? outputDirURI : stagingDirURI;
-      pathRDD.foreach(pathAndIdx -> {
-        for (PinotFSSpec pinotFSSpec : _spec.getPinotFSSpecs()) {
-          Configuration config = new MapConfiguration(pinotFSSpec.getConfigs());
-          PinotFSFactory.register(pinotFSSpec.getScheme(), pinotFSSpec.getClassName(), config);
-        }
-        PinotFS finalOutputDirFS = PinotFSFactory.create(finalOutputDirURI.getScheme());
-        String[] splits = pathAndIdx.split(" ");
-        String path = splits[0];
-        int idx = Integer.valueOf(splits[1]);
-        // Load Pinot Plugins copied from Distributed cache.
-        File localPluginsTarFile = new File(PINOT_PLUGINS_TAR_GZ);
-        if (localPluginsTarFile.exists()) {
-          File pluginsDirFile = new File(PINOT_PLUGINS_DIR + "-" + idx);
-          try {
-            TarGzCompressionUtils.unTar(localPluginsTarFile, pluginsDirFile);
-          } catch (Exception e) {
-            LOGGER.error("Failed to untar local Pinot plugins tarball file [{}]", localPluginsTarFile, e);
-            throw new RuntimeException(e);
+      // Prevent using lambda expression in Spark to avoid potential serialization exceptions, use inner function instead.
+      pathRDD.foreach(new VoidFunction<String>() {
+        @Override
+        public void call(String pathAndIdx)
+            throws Exception {
+          PluginManager.get().init();
+          for (PinotFSSpec pinotFSSpec : _spec.getPinotFSSpecs()) {
+            PinotFSFactory
+                .register(pinotFSSpec.getScheme(), pinotFSSpec.getClassName(), new PinotConfiguration(pinotFSSpec));
           }
-          LOGGER.info("Trying to set System Property: [{}={}]", PLUGINS_DIR_PROPERTY_NAME,
-              pluginsDirFile.getAbsolutePath());
-          System.setProperty(PLUGINS_DIR_PROPERTY_NAME, pluginsDirFile.getAbsolutePath());
-          if (pluginsInclude != null) {
-            LOGGER.info("Trying to set System Property: [{}={}]", PLUGINS_INCLUDE_PROPERTY_NAME, pluginsInclude);
-            System.setProperty(PLUGINS_INCLUDE_PROPERTY_NAME, pluginsInclude);
+          PinotFS finalOutputDirFS = PinotFSFactory.create(finalOutputDirURI.getScheme());
+          String[] splits = pathAndIdx.split(" ");
+          String path = splits[0];
+          int idx = Integer.valueOf(splits[1]);
+          // Load Pinot Plugins copied from Distributed cache.
+          File localPluginsTarFile = new File(PINOT_PLUGINS_TAR_GZ);
+          if (localPluginsTarFile.exists()) {
+            File pluginsDirFile = new File(PINOT_PLUGINS_DIR + "-" + idx);
+            try {
+              TarGzCompressionUtils.untar(localPluginsTarFile, pluginsDirFile);
+            } catch (Exception e) {
+              LOGGER.error("Failed to untar local Pinot plugins tarball file [{}]", localPluginsTarFile, e);
+              throw new RuntimeException(e);
+            }
+            LOGGER.info("Trying to set System Property: [{}={}]", PLUGINS_DIR_PROPERTY_NAME,
+                pluginsDirFile.getAbsolutePath());
+            System.setProperty(PLUGINS_DIR_PROPERTY_NAME, pluginsDirFile.getAbsolutePath());
+            if (pluginsInclude != null) {
+              LOGGER.info("Trying to set System Property: [{}={}]", PLUGINS_INCLUDE_PROPERTY_NAME, pluginsInclude);
+              System.setProperty(PLUGINS_INCLUDE_PROPERTY_NAME, pluginsInclude);
+            }
+            LOGGER.info("Pinot plugins System Properties are set at [{}], plugins includes [{}]",
+                System.getProperty(PLUGINS_DIR_PROPERTY_NAME), System.getProperty(PLUGINS_INCLUDE_PROPERTY_NAME));
+          } else {
+            LOGGER.warn("Cannot find local Pinot plugins tar file at [{}]", localPluginsTarFile.getAbsolutePath());
           }
-          LOGGER.info("Pinot plugins System Properties are set at [{}], plugins includes [{}]",
-              System.getProperty(PLUGINS_DIR_PROPERTY_NAME), System.getProperty(PLUGINS_INCLUDE_PROPERTY_NAME));
-        } else {
-          LOGGER.warn("Cannot find local Pinot plugins tar file at [{}]", localPluginsTarFile.getAbsolutePath());
+          URI inputFileURI = URI.create(path);
+          if (inputFileURI.getScheme() == null) {
+            inputFileURI =
+                new URI(finalInputDirURI.getScheme(), inputFileURI.getSchemeSpecificPart(), inputFileURI.getFragment());
+          }
+
+          //create localTempDir for input and output
+          File localTempDir = new File(FileUtils.getTempDirectory(), "pinot-" + UUID.randomUUID());
+          File localInputTempDir = new File(localTempDir, "input");
+          FileUtils.forceMkdir(localInputTempDir);
+          File localOutputTempDir = new File(localTempDir, "output");
+          FileUtils.forceMkdir(localOutputTempDir);
+
+          //copy input path to local
+          File localInputDataFile = new File(localInputTempDir, getFileName(inputFileURI));
+          LOGGER.info("Trying to copy input file from {} to {}", inputFileURI, localInputDataFile);
+          PinotFSFactory.create(inputFileURI.getScheme()).copyToLocalFile(inputFileURI, localInputDataFile);
+
+          //create task spec
+          SegmentGenerationTaskSpec taskSpec = new SegmentGenerationTaskSpec();
+          taskSpec.setInputFilePath(localInputDataFile.getAbsolutePath());
+          taskSpec.setOutputDirectoryPath(localOutputTempDir.getAbsolutePath());
+          taskSpec.setRecordReaderSpec(_spec.getRecordReaderSpec());
+          taskSpec.setSchema(SegmentGenerationUtils.getSchema(_spec.getTableSpec().getSchemaURI()));
+          taskSpec.setTableConfig(
+              SegmentGenerationUtils.getTableConfig(_spec.getTableSpec().getTableConfigURI()).toJsonNode());
+          taskSpec.setSequenceId(idx);
+          taskSpec.setSegmentNameGeneratorSpec(_spec.getSegmentNameGeneratorSpec());
+
+          SegmentGenerationTaskRunner taskRunner = new SegmentGenerationTaskRunner(taskSpec);
+          String segmentName = taskRunner.run();
+
+          // Tar segment directory to compress file
+          File localSegmentDir = new File(localOutputTempDir, segmentName);
+          String segmentTarFileName = segmentName + Constants.TAR_GZ_FILE_EXT;
+          File localSegmentTarFile = new File(localOutputTempDir, segmentTarFileName);
+          LOGGER.info("Tarring segment from: {} to: {}", localSegmentDir, localSegmentTarFile);
+          TarGzCompressionUtils.createTarGzFile(localSegmentDir, localSegmentTarFile);
+          long uncompressedSegmentSize = FileUtils.sizeOf(localSegmentDir);
+          long compressedSegmentSize = FileUtils.sizeOf(localSegmentTarFile);
+          LOGGER.info("Size for segment: {}, uncompressed: {}, compressed: {}", segmentName,
+              DataSizeUtils.fromBytes(uncompressedSegmentSize), DataSizeUtils.fromBytes(compressedSegmentSize));
+          //move segment to output PinotFS
+          URI outputSegmentTarURI =
+              SegmentGenerationUtils.getRelativeOutputPath(finalInputDirURI, inputFileURI, finalOutputDirURI)
+                  .resolve(segmentTarFileName);
+          LOGGER.info("Trying to move segment tar file from: [{}] to [{}]", localSegmentTarFile, outputSegmentTarURI);
+          if (!_spec.isOverwriteOutput() && PinotFSFactory.create(outputSegmentTarURI.getScheme())
+              .exists(outputSegmentTarURI)) {
+            LOGGER.warn("Not overwrite existing output segment tar file: {}",
+                finalOutputDirFS.exists(outputSegmentTarURI));
+          } else {
+            finalOutputDirFS.copyFromLocalFile(localSegmentTarFile, outputSegmentTarURI);
+          }
+          FileUtils.deleteQuietly(localSegmentDir);
+          FileUtils.deleteQuietly(localSegmentTarFile);
+          FileUtils.deleteQuietly(localInputDataFile);
         }
-        URI inputFileURI = URI.create(path);
-        if (inputFileURI.getScheme() == null) {
-          inputFileURI =
-              new URI(finalInputDirURI.getScheme(), inputFileURI.getSchemeSpecificPart(), inputFileURI.getFragment());
-        }
-
-        //create localTempDir for input and output
-        File localTempDir = new File(FileUtils.getTempDirectory(), "pinot-" + System.currentTimeMillis());
-        File localInputTempDir = new File(localTempDir, "input");
-        FileUtils.forceMkdir(localInputTempDir);
-        File localOutputTempDir = new File(localTempDir, "output");
-        FileUtils.forceMkdir(localOutputTempDir);
-
-        //copy input path to local
-        File localInputDataFile = new File(localInputTempDir, getFileName(inputFileURI));
-        LOGGER.info("Trying to copy input file from {} to {}", inputFileURI, localInputDataFile);
-        PinotFSFactory.create(inputFileURI.getScheme()).copyToLocalFile(inputFileURI, localInputDataFile);
-
-        //create task spec
-        SegmentGenerationTaskSpec taskSpec = new SegmentGenerationTaskSpec();
-        taskSpec.setInputFilePath(localInputDataFile.getAbsolutePath());
-        taskSpec.setOutputDirectoryPath(localOutputTempDir.getAbsolutePath());
-        taskSpec.setRecordReaderSpec(_spec.getRecordReaderSpec());
-        taskSpec.setSchema(SegmentGenerationUtils.getSchema(_spec.getTableSpec().getSchemaURI()));
-        taskSpec.setTableConfig(
-            SegmentGenerationUtils.getTableConfig(_spec.getTableSpec().getTableConfigURI()).toJsonNode());
-        taskSpec.setSequenceId(idx);
-        taskSpec.setSegmentNameGeneratorSpec(_spec.getSegmentNameGeneratorSpec());
-
-        SegmentGenerationTaskRunner taskRunner = new SegmentGenerationTaskRunner(taskSpec);
-        String segmentName = taskRunner.run();
-
-        // Tar segment directory to compress file
-        File localSegmentDir = new File(localOutputTempDir, segmentName);
-        String segmentTarFileName = segmentName + Constants.TAR_GZ_FILE_EXT;
-        File localSegmentTarFile = new File(localOutputTempDir, segmentTarFileName);
-        LOGGER.info("Tarring segment from: {} to: {}", localSegmentDir, localSegmentTarFile);
-        TarGzCompressionUtils.createTarGzOfDirectory(localSegmentDir.getPath(), localSegmentTarFile.getPath());
-        long uncompressedSegmentSize = FileUtils.sizeOf(localSegmentDir);
-        long compressedSegmentSize = FileUtils.sizeOf(localSegmentTarFile);
-        LOGGER.info("Size for segment: {}, uncompressed: {}, compressed: {}", segmentName,
-            DataSizeUtils.fromBytes(uncompressedSegmentSize), DataSizeUtils.fromBytes(compressedSegmentSize));
-        //move segment to output PinotFS
-        URI outputSegmentTarURI =
-            SegmentGenerationUtils.getRelativeOutputPath(finalInputDirURI, inputFileURI, finalOutputDirURI)
-                .resolve(segmentTarFileName);
-        LOGGER.info("Trying to move segment tar file from: [{}] to [{}]", localSegmentTarFile, outputSegmentTarURI);
-        if (!_spec.isOverwriteOutput() && PinotFSFactory.create(outputSegmentTarURI.getScheme())
-            .exists(outputSegmentTarURI)) {
-          LOGGER
-              .warn("Not overwrite existing output segment tar file: {}", finalOutputDirFS.exists(outputSegmentTarURI));
-        } else {
-          finalOutputDirFS.copyFromLocalFile(localSegmentTarFile, outputSegmentTarURI);
-        }
-        FileUtils.deleteQuietly(localSegmentDir);
-        FileUtils.deleteQuietly(localSegmentTarFile);
-        FileUtils.deleteQuietly(localInputDataFile);
       });
       if (stagingDirURI != null) {
         LOGGER.info("Trying to copy segment tars from staging directory: [{}] to output directory [{}]", stagingDirURI,
@@ -332,15 +366,16 @@ public class SparkSegmentGenerationJobRunner implements IngestionJobRunner, Seri
   }
 
   protected void packPluginsToDistributedCache(JavaSparkContext sparkContext) {
-    String pluginsRootDir = PluginManager.get().getPluginsRootDir();
-    if (pluginsRootDir == null) {
+    String pluginsRootDirPath = PluginManager.get().getPluginsRootDir();
+    if (pluginsRootDirPath == null) {
       LOGGER.warn("Local Pinot plugins directory is null, skip packaging...");
       return;
     }
-    if (new File(pluginsRootDir).exists()) {
+    File pluginsRootDir = new File(pluginsRootDirPath);
+    if (pluginsRootDir.exists()) {
       File pluginsTarGzFile = new File(PINOT_PLUGINS_TAR_GZ);
       try {
-        TarGzCompressionUtils.createTarGzOfDirectory(pluginsRootDir, pluginsTarGzFile.getPath());
+        TarGzCompressionUtils.createTarGzFile(pluginsRootDir, pluginsTarGzFile);
       } catch (IOException e) {
         LOGGER.error("Failed to tar plugins directory", e);
       }
@@ -350,7 +385,7 @@ public class SparkSegmentGenerationJobRunner implements IngestionJobRunner, Seri
         sparkContext.getConf().set(PLUGINS_INCLUDE_PROPERTY_NAME, pluginsIncludes);
       }
     } else {
-      LOGGER.warn("Cannot find local Pinot plugins directory at [{}]", pluginsRootDir);
+      LOGGER.warn("Cannot find local Pinot plugins directory at [{}]", pluginsRootDirPath);
     }
   }
 }

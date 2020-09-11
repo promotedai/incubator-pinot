@@ -24,7 +24,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -42,17 +41,19 @@ import org.apache.pinot.core.segment.creator.impl.SegmentIndexCreationDriverImpl
 import org.apache.pinot.core.segment.name.NormalizedDateSegmentNameGenerator;
 import org.apache.pinot.core.segment.name.SegmentNameGenerator;
 import org.apache.pinot.core.segment.name.SimpleSegmentNameGenerator;
+import org.apache.pinot.hadoop.job.InternalConfigConstants;
 import org.apache.pinot.ingestion.common.JobConfigConstants;
+import org.apache.pinot.ingestion.jobs.SegmentCreationJob;
 import org.apache.pinot.plugin.inputformat.csv.CSVRecordReaderConfig;
 import org.apache.pinot.plugin.inputformat.protobuf.ProtoBufRecordReaderConfig;
 import org.apache.pinot.plugin.inputformat.thrift.ThriftRecordReaderConfig;
 import org.apache.pinot.spi.config.table.SegmentsValidationAndRetentionConfig;
 import org.apache.pinot.spi.config.table.TableConfig;
+import org.apache.pinot.spi.config.table.TableCustomConfig;
 import org.apache.pinot.spi.data.DateTimeFieldSpec;
 import org.apache.pinot.spi.data.DateTimeFormatSpec;
-import org.apache.pinot.spi.data.FieldSpec;
 import org.apache.pinot.spi.data.Schema;
-import org.apache.pinot.spi.data.TimeFieldSpec;
+import org.apache.pinot.spi.data.IngestionSchemaValidator;
 import org.apache.pinot.spi.data.readers.FileFormat;
 import org.apache.pinot.spi.data.readers.RecordReaderConfig;
 import org.apache.pinot.spi.utils.DataSizeUtils;
@@ -73,6 +74,7 @@ public class SegmentCreationMapper extends Mapper<LongWritable, Text, LongWritab
   protected Schema _schema;
   protected SegmentNameGenerator _segmentNameGenerator;
   protected boolean _useRelativePath = false;
+  protected boolean _failIfSchemaMismatch = false;
 
   // Optional
   protected TableConfig _tableConfig;
@@ -87,6 +89,12 @@ public class SegmentCreationMapper extends Mapper<LongWritable, Text, LongWritab
   protected File _localInputDir;
   protected File _localSegmentDir;
   protected File _localSegmentTarDir;
+
+  // Counter for detecting schema mismatch
+  private int _dataTypeMismatch = 0;
+  private int _singleValueMultiValueFieldMismatch = 0;
+  private int _multiValueStructureMismatch = 0;
+  private int _missingPinotColumn = 0;
 
   /**
    * Generate a relative output directory path when `useRelativePath` flag is on.
@@ -126,6 +134,9 @@ public class SegmentCreationMapper extends Mapper<LongWritable, Text, LongWritab
       _readerConfigFile = new Path(readerConfigFile);
     }
     _recordReaderPath = _jobConf.get(JobConfigConstants.RECORD_READER_PATH);
+    Preconditions.checkNotNull(_tableConfig);
+
+    setFlagForSchemaMismatch();
 
     // Set up segment name generator
     String segmentNameGeneratorType =
@@ -254,6 +265,7 @@ public class SegmentCreationMapper extends Mapper<LongWritable, Text, LongWritab
     progressReporterThread.start();
     try {
       driver.init(segmentGeneratorConfig);
+      validateSchema(driver.getIngestionSchemaValidator());
       driver.build();
     } catch (Exception e) {
       _logger.error("Caught exception while creating segment with HDFS input file: {}, sequence id: {}", hdfsInputFile,
@@ -273,7 +285,7 @@ public class SegmentCreationMapper extends Mapper<LongWritable, Text, LongWritab
     String segmentTarFileName = segmentName + JobConfigConstants.TAR_GZ_FILE_EXT;
     File localSegmentTarFile = new File(_localSegmentTarDir, segmentTarFileName);
     _logger.info("Tarring segment from: {} to: {}", localSegmentDir, localSegmentTarFile);
-    TarGzCompressionUtils.createTarGzOfDirectory(localSegmentDir.getPath(), localSegmentTarFile.getPath());
+    TarGzCompressionUtils.createTarGzFile(localSegmentDir, localSegmentTarFile);
 
     long uncompressedSegmentSize = FileUtils.sizeOf(localSegmentDir);
     long compressedSegmentSize = FileUtils.sizeOf(localSegmentTarFile);
@@ -356,8 +368,60 @@ public class SegmentCreationMapper extends Mapper<LongWritable, Text, LongWritab
       int sequenceId) {
   }
 
+  private void setFlagForSchemaMismatch() {
+    String failJobMsg = "Set to fail the job if schemas mismatch.";
+    String notFailJobMsg = "Set NOT to fail the job if schemas mismatch.";
+    TableCustomConfig tableCustomConfig = _tableConfig.getCustomConfig();
+    if (tableCustomConfig == null) {
+      _logger.info(notFailJobMsg);
+      return;
+    }
+    Map<String, String> customConfigsMap = tableCustomConfig.getCustomConfigs();
+    if (customConfigsMap != null && customConfigsMap.containsKey(InternalConfigConstants.FAIL_ON_SCHEMA_MISMATCH)) {
+      _failIfSchemaMismatch = Boolean.parseBoolean(customConfigsMap.get(InternalConfigConstants.FAIL_ON_SCHEMA_MISMATCH));
+    }
+    _logger.info(_failIfSchemaMismatch ? failJobMsg : notFailJobMsg);
+  }
+
+  private void validateSchema(IngestionSchemaValidator ingestionSchemaValidator) {
+    if (ingestionSchemaValidator == null) {
+      return;
+    }
+    if (ingestionSchemaValidator.getDataTypeMismatchResult().isMismatchDetected()) {
+      _dataTypeMismatch++;
+      _logger.warn(ingestionSchemaValidator.getDataTypeMismatchResult().getMismatchReason());
+    }
+    if (ingestionSchemaValidator.getSingleValueMultiValueFieldMismatchResult().isMismatchDetected()) {
+      _singleValueMultiValueFieldMismatch++;
+      ingestionSchemaValidator.getSingleValueMultiValueFieldMismatchResult().getMismatchReason();
+    }
+    if (ingestionSchemaValidator.getMultiValueStructureMismatchResult().isMismatchDetected()) {
+      _multiValueStructureMismatch++;
+      ingestionSchemaValidator.getMultiValueStructureMismatchResult().getMismatchReason();
+    }
+    if (ingestionSchemaValidator.getMissingPinotColumnResult().isMismatchDetected()) {
+      _missingPinotColumn++;
+      ingestionSchemaValidator.getMissingPinotColumnResult().getMismatchReason();
+    }
+
+    if (isSchemaMismatch() && _failIfSchemaMismatch) {
+      throw new RuntimeException("Schema mismatch detected. Forcing to fail the job. Please checking log message above.");
+    }
+  }
+
+  private boolean isSchemaMismatch() {
+    return _dataTypeMismatch + _singleValueMultiValueFieldMismatch + _multiValueStructureMismatch + _missingPinotColumn
+        != 0;
+  }
+
   @Override
   public void cleanup(Context context) {
+    context.getCounter(SegmentCreationJob.SchemaMisMatchCounter.DATA_TYPE_MISMATCH).increment(_dataTypeMismatch);
+    context.getCounter(SegmentCreationJob.SchemaMisMatchCounter.SINGLE_VALUE_MULTI_VALUE_FIELD_MISMATCH)
+        .increment(_singleValueMultiValueFieldMismatch);
+    context.getCounter(SegmentCreationJob.SchemaMisMatchCounter.MULTI_VALUE_FIELD_STRUCTURE_MISMATCH)
+        .increment(_multiValueStructureMismatch);
+    context.getCounter(SegmentCreationJob.SchemaMisMatchCounter.MISSING_PINOT_COLUMN).increment(_missingPinotColumn);
     _logger.info("Deleting local temporary directory: {}", _localStagingDir);
     FileUtils.deleteQuietly(_localStagingDir);
   }

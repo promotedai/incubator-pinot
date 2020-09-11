@@ -48,15 +48,17 @@ import org.apache.commons.configuration.Configuration;
 import org.apache.pinot.common.exception.TableNotFoundException;
 import org.apache.pinot.common.metrics.ControllerMeter;
 import org.apache.pinot.common.metrics.ControllerMetrics;
-import org.apache.pinot.common.utils.config.TableConfigUtils;
 import org.apache.pinot.controller.ControllerConf;
 import org.apache.pinot.controller.helix.core.PinotHelixResourceManager;
 import org.apache.pinot.controller.helix.core.rebalance.RebalanceConfigConstants;
 import org.apache.pinot.controller.helix.core.rebalance.RebalanceResult;
+import org.apache.pinot.controller.recommender.RecommenderDriver;
 import org.apache.pinot.core.util.ReplicationUtils;
+import org.apache.pinot.core.util.TableConfigUtils;
 import org.apache.pinot.spi.config.table.SegmentsValidationAndRetentionConfig;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
+import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.utils.JsonUtils;
 import org.apache.pinot.spi.utils.builder.TableNameBuilder;
 import org.slf4j.LoggerFactory;
@@ -112,7 +114,12 @@ public class PinotTableRestletResource {
     TableConfig tableConfig;
     try {
       tableConfig = JsonUtils.stringToObject(tableConfigStr, TableConfig.class);
-      TableConfigUtils.validate(tableConfig);
+      Schema schema = _pinotHelixResourceManager.getSchemaForTableConfig(tableConfig);
+      // TableConfigUtils.validate(...) is used across table create/update.
+      TableConfigUtils.validate(tableConfig, schema);
+      // TableConfigUtils.validateTableName(...) checks table name rules.
+      // So it won't effect already created tables.
+      TableConfigUtils.validateTableName(tableConfig);
     } catch (Exception e) {
       throw new ControllerApplicationException(LOGGER, e.getMessage(), Response.Status.BAD_REQUEST, e);
     }
@@ -134,6 +141,18 @@ public class PinotTableRestletResource {
       } else {
         throw new ControllerApplicationException(LOGGER, e.getMessage(), Response.Status.INTERNAL_SERVER_ERROR, e);
       }
+    }
+  }
+
+  @PUT
+  @Produces(MediaType.APPLICATION_JSON)
+  @Path("/tables/recommender")
+  @ApiOperation(value = "Recommend config", notes = "Recommend a config with input json")
+  public String recommendConfig(String inputStr) {
+    try {
+      return RecommenderDriver.run(inputStr);
+    }catch (Exception e){
+      throw new ControllerApplicationException(LOGGER, e.getMessage(), Response.Status.BAD_REQUEST, e);
     }
   }
 
@@ -308,7 +327,8 @@ public class PinotTableRestletResource {
     TableConfig tableConfig;
     try {
       tableConfig = JsonUtils.stringToObject(tableConfigString, TableConfig.class);
-      TableConfigUtils.validate(tableConfig);
+      Schema schema = _pinotHelixResourceManager.getSchemaForTableConfig(tableConfig);
+      TableConfigUtils.validate(tableConfig, schema);
     } catch (Exception e) {
       throw new ControllerApplicationException(LOGGER, "Invalid table config", Response.Status.BAD_REQUEST, e);
     }
@@ -351,7 +371,8 @@ public class PinotTableRestletResource {
   public String checkTableConfig(String tableConfigStr) {
     try {
       TableConfig tableConfig = JsonUtils.stringToObject(tableConfigStr, TableConfig.class);
-      TableConfigUtils.validate(tableConfig);
+      Schema schema = _pinotHelixResourceManager.getSchemaForTableConfig(tableConfig);
+      TableConfigUtils.validate(tableConfig, schema);
       ObjectNode tableConfigValidateStr = JsonUtils.newObjectNode();
       if (tableConfig.getTableType() == TableType.OFFLINE) {
         tableConfigValidateStr.set(TableType.OFFLINE.name(), tableConfig.toJsonNode());

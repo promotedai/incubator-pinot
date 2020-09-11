@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLContext;
+import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.http.Header;
@@ -97,8 +98,8 @@ public class FileUploadDownloadClient implements Closeable {
   public static final int GET_REQUEST_SOCKET_TIMEOUT_MS = 5 * 1000; // 5 seconds
   public static final int DELETE_REQUEST_SOCKET_TIMEOUT_MS = 10 * 1000; // 10 seconds
 
-  private static final String HTTP = "http";
-  private static final String HTTPS = "https";
+  private static final String HTTP = CommonConstants.HTTP_PROTOCOL;
+  private static final String HTTPS = CommonConstants.HTTPS_PROTOCOL;
   private static final String SCHEMA_PATH = "/schemas";
   private static final String OLD_SEGMENT_PATH = "/segments";
   private static final String SEGMENT_PATH = "/v2/segments";
@@ -326,6 +327,12 @@ public class FileUploadDownloadClient implements Closeable {
   private static HttpUriRequest getDownloadFileRequest(URI uri, int socketTimeoutMs) {
     RequestBuilder requestBuilder = RequestBuilder.get(uri).setVersion(HttpVersion.HTTP_1_1);
     setTimeout(requestBuilder, socketTimeoutMs);
+    String userInfo = uri.getUserInfo();
+    if (userInfo != null) {
+      String encoded = Base64.encodeBase64String(StringUtil.encodeUtf8(userInfo));
+      String authHeader = "Basic " + encoded;
+      requestBuilder.addHeader(HttpHeaders.AUTHORIZATION, authHeader);
+    }
     return requestBuilder.build();
   }
 

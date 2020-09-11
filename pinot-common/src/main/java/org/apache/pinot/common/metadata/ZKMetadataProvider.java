@@ -274,12 +274,21 @@ public class ZKMetadataProvider {
     if (tableType == null || tableType == TableType.REALTIME) {
       TableConfig realtimeTableConfig = getRealtimeTableConfig(propertyStore, tableName);
       if (realtimeTableConfig != null) {
-        schema = getSchema(propertyStore, realtimeTableConfig.getValidationConfig().getSchemaName());
+        String realtimeSchemaNameFromValidationConfig = realtimeTableConfig.getValidationConfig().getSchemaName();
+        if (realtimeSchemaNameFromValidationConfig != null) {
+          schema = getSchema(propertyStore, realtimeSchemaNameFromValidationConfig);
+        }
       }
     }
     // Try to fetch offline schema if realtime schema does not exist
     if (schema == null && (tableType == null || tableType == TableType.OFFLINE)) {
-      schema = getSchema(propertyStore, TableNameBuilder.OFFLINE.tableNameWithType(tableName));
+      TableConfig offlineTableConfig = getOfflineTableConfig(propertyStore, tableName);
+      if (offlineTableConfig != null) {
+        String offlineSchemaNameFromValidationConfig = offlineTableConfig.getValidationConfig().getSchemaName();
+        if (offlineSchemaNameFromValidationConfig != null) {
+          schema = getSchema(propertyStore, offlineSchemaNameFromValidationConfig);
+        }
+      }
     }
     if (schema != null) {
       LOGGER.warn("Schema name does not match raw table name, schema name: {}, raw table name: {}",

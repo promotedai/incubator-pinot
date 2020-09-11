@@ -19,6 +19,7 @@ import org.apache.pinot.thirdeye.detection.components.ThresholdRuleDetector;
 import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import org.apache.pinot.thirdeye.detection.validators.ConfigValidationException;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
@@ -62,7 +63,7 @@ public class DetectionConfigTranslatorTest {
     datasetConfigDTO.setDataset("test_dataset");
     datasetConfigDTO.setTimeUnit(TimeUnit.DAYS);
     datasetConfigDTO.setTimeDuration(1);
-    datasetConfigDTO.setDataSource(PinotThirdEyeDataSource.DATA_SOURCE_NAME);
+    datasetConfigDTO.setDataSource(PinotThirdEyeDataSource.class.getSimpleName());
     daoRegistry.getDatasetConfigDAO().save(datasetConfigDTO);
 
     this.yaml = new Yaml();
@@ -93,7 +94,7 @@ public class DetectionConfigTranslatorTest {
     Assert.assertTrue(result.isDataAvailabilitySchedule());
   }
 
-  @Test(expectedExceptions = IllegalArgumentException.class)
+  @Test(expectedExceptions = ConfigValidationException.class)
   public void testBuildDetectionPipelineMissModuleType() throws Exception {
     this.yamlConfig = (Map<String, Object>) this.yaml.load(this.getClass().getResourceAsStream("pipeline-config-1.yaml"));
     this.yamlConfig.put("rules", Collections.singletonList(
@@ -102,7 +103,7 @@ public class DetectionConfigTranslatorTest {
     translator.translate();
   }
 
-  @Test(expectedExceptions = IllegalArgumentException.class)
+  @Test(expectedExceptions = ConfigValidationException.class)
   public void testMultipleGrouperLogic() throws Exception {
     String yamlConfig = IOUtils.toString(this.getClass().getResourceAsStream("pipeline-config-3.yaml"), "UTF-8");
     DetectionConfigTranslator translator = new DetectionConfigTranslator(yamlConfig, this.provider);

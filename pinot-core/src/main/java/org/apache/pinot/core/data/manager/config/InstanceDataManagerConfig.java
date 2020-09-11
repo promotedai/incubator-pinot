@@ -18,12 +18,12 @@
  */
 package org.apache.pinot.core.data.manager.config;
 
-import org.apache.commons.configuration.Configuration;
 import org.apache.pinot.common.segment.ReadMode;
+import org.apache.pinot.spi.env.PinotConfiguration;
 
 
 public interface InstanceDataManagerConfig {
-  Configuration getConfig();
+  PinotConfiguration getConfig();
 
   String getInstanceId();
 
@@ -47,7 +47,7 @@ public interface InstanceDataManagerConfig {
 
   boolean isRealtimeOffHeapAllocation();
 
-  boolean isDirectRealtimeOffheapAllocation();
+  boolean isDirectRealtimeOffHeapAllocation();
 
   int getMaxParallelSegmentBuilds();
 }

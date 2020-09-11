@@ -376,6 +376,7 @@ public abstract class AbstractMetrics<QP extends AbstractMetrics.QueryPhase, M e
    */
   public void initializeGlobalMeters() {
     M[] meters = getMeters();
+    LOGGER.info("Initializing global {} meters", meters.length);
 
     for (M meter : meters) {
       if (meter.isGlobal()) {
@@ -384,9 +385,35 @@ public abstract class AbstractMetrics<QP extends AbstractMetrics.QueryPhase, M e
     }
 
     G[] gauges = getGauges();
+    LOGGER.info("Initializing global {} gauges", gauges.length);
     for (G gauge : gauges) {
       if (gauge.isGlobal()) {
         setValueOfGlobalGauge(gauge, 0);
+      }
+    }
+  }
+
+  public void addCallbackTableGaugeIfNeeded(final String tableName, final G gauge, final Callable<Long> valueCallback) {
+    final String fullGaugeName;
+    String gaugeName = gauge.getGaugeName();
+    fullGaugeName = gaugeName + "." + getTableName(tableName);
+
+    addCallbackGaugeIfNeeded(fullGaugeName, valueCallback);
+  }
+
+  /**
+   * Similar to addCallbackGauge method.
+   * This method may be called multiple times, while it will be registered to callback function only once.
+   * @param metricName The name of the metric
+   * @param valueCallback The callback function used to retrieve the value of the gauge
+   */
+  public void addCallbackGaugeIfNeeded(final String metricName, final Callable<Long> valueCallback) {
+    if (!_gaugeValues.containsKey(metricName)) {
+      synchronized (_gaugeValues) {
+        if (!_gaugeValues.containsKey(metricName)) {
+          _gaugeValues.put(metricName, new AtomicLong(0L));
+          addCallbackGauge(metricName, valueCallback);
+        }
       }
     }
   }
