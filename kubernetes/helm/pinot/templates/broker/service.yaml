@@ -27,6 +27,10 @@ metadata:
     component: {{ .Values.broker.name }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
+  annotations:
+{{- if .Values.broker.service.annotations }}
+{{ .Values.broker.service.annotations | toYaml | trimSuffix "\n" | indent 4 }}
+{{- end }}
 spec:
   type: {{ .Values.broker.service.type }}
   ports:

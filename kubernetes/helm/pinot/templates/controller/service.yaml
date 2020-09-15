@@ -27,6 +27,10 @@ metadata:
     component: {{ .Values.controller.name }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
+  annotations:
+{{- if .Values.controller.service.annotations }}
+{{ .Values.controller.service.annotations | toYaml | trimSuffix "\n" | indent 4 }}
+{{- end }}
 spec:
   type: {{ .Values.controller.service.type }}
   ports:
